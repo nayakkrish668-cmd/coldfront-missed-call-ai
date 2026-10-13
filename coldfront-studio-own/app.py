@@ -122,6 +122,11 @@ def voice():
     log_event("incoming_call", caller=caller)
 
     vr = VoiceResponse()
+    vr.say(
+        "Thanks for calling ColdFront Studio. If we're unable to answer, "
+        "you'll receive a text message to follow up. By continuing this call, "
+        "you agree to receive that message. Message and data rates may apply."
+    )
     if FORWARD_TO:
         dial = Dial(
             timeout=RING_TIMEOUT_SECONDS,

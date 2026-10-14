@@ -1,0 +1,4 @@
+data.db
+events.log
+__pycache__/
+*.pyc

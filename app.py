@@ -17,11 +17,15 @@ for what to harden before using it with a real client's phone number.
 """
 
 import os
+import sqlite3
 import datetime
 import logging
-from flask import Flask, request, Response
+from contextlib import closing
+from functools import wraps
+from flask import Flask, request, Response, abort
 from twilio.twiml.voice_response import VoiceResponse, Dial, Gather
 from twilio.twiml.messaging_response import MessagingResponse
+from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 from anthropic import Anthropic
 
@@ -41,6 +45,7 @@ RING_TIMEOUT_SECONDS = int(os.environ.get("RING_TIMEOUT_SECONDS", "18"))
 
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID else None
 ai_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+request_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
 
 logging.basicConfig(
     filename="events.log",
@@ -48,14 +53,114 @@ logging.basicConfig(
     format="%(asctime)s %(message)s",
 )
 
-# In-memory store of conversation history per caller, for this demo.
-# A real deployment would use a database (SQLite/Postgres) instead.
-CONVERSATIONS: dict[str, list[dict]] = {}
+# ---------------------------------------------------------------------
+# Storage: SQLite instead of in-memory dicts, so consent records and
+# conversation history survive a worker restart (not just a live process).
+#
+# NOTE: on Render's free tier (no attached persistent disk), this file
+# still lives on ephemeral local storage and is wiped on a fresh deploy
+# or a dyno-level rebuild — it is NOT a substitute for a managed database
+# like Postgres if you need records to survive indefinitely. Attach a
+# Render disk (or move to Postgres) before this matters for real audits.
+# ---------------------------------------------------------------------
+DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db"))
 
-# In-memory store of whether a caller pressed 1 to opt in to SMS follow-up,
-# keyed by their phone number. A real deployment would persist this
-# (SQLite/Postgres) rather than lose it on restart.
-SMS_CONSENT: dict[str, bool] = {}
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with closing(get_db()) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sms_consent (
+                phone TEXT PRIMARY KEY,
+                consented INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+init_db()
+
+
+def set_consent(phone: str, consented: bool):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO sms_consent (phone, consented, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(phone) DO UPDATE SET consented=excluded.consented, updated_at=excluded.updated_at",
+            (phone, int(consented), datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def has_consent(phone: str) -> bool:
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT consented FROM sms_consent WHERE phone = ?", (phone,)).fetchone()
+        return bool(row["consented"]) if row else False
+
+
+def get_history(phone: str) -> list[dict]:
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE phone = ? ORDER BY id ASC", (phone,)
+        ).fetchall()
+        return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+
+def append_message(phone: str, role: str, content: str):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO messages (phone, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (phone, role, content, datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def validate_twilio_request(f):
+    """Reject any request to a Twilio webhook that isn't actually signed by
+    Twilio. Without this, anyone who finds the URL can POST fake call/SMS
+    events and trigger real text sends on your Twilio bill."""
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if request_validator is None:
+            log_event("twilio_signature_check_skipped_no_auth_token")
+            abort(403)
+
+        signature = request.headers.get("X-Twilio-Signature", "")
+        query_string = request.query_string.decode()
+        url = f"{PUBLIC_BASE_URL.rstrip('/')}{request.path}"
+        if query_string:
+            url = f"{url}?{query_string}"
+
+        if not request_validator.validate(url, request.form, signature):
+            log_event(
+                "twilio_signature_invalid",
+                path=request.path,
+                remote_addr=request.remote_addr,
+            )
+            abort(403)
+        return f(*args, **kwargs)
+
+    return decorated
+
 
 OPT_IN_PROMPT = (
     f"Thanks for calling {BUSINESS_NAME}. Press 1 to opt in to receive a "
@@ -90,8 +195,8 @@ def send_sms(to: str, body: str):
 
 
 def ai_reply(caller: str, incoming_text: str) -> str:
-    history = CONVERSATIONS.setdefault(caller, [])
-    history.append({"role": "user", "content": incoming_text})
+    append_message(caller, "user", incoming_text)
+    history = get_history(caller)
 
     if ai_client:
         resp = ai_client.messages.create(
@@ -109,7 +214,7 @@ def ai_reply(caller: str, incoming_text: str) -> str:
             "— set ANTHROPIC_API_KEY to enable real responses.)"
         )
 
-    history.append({"role": "assistant", "content": reply_text})
+    append_message(caller, "assistant", reply_text)
     return reply_text
 
 
@@ -117,6 +222,7 @@ def ai_reply(caller: str, incoming_text: str) -> str:
 # Voice: incoming call -> try to forward it to the real business line
 # ---------------------------------------------------------------------
 @app.route("/voice", methods=["POST"])
+@validate_twilio_request
 def voice():
     caller = request.form.get("From", "unknown")
     log_event("incoming_call", caller=caller)
@@ -140,11 +246,12 @@ def voice():
 
 
 @app.route("/voice/opt-in", methods=["POST"])
+@validate_twilio_request
 def voice_opt_in():
     caller = request.form.get("From", "unknown")
     digits = request.form.get("Digits", "")
     consented = digits.strip() == "1"
-    SMS_CONSENT[caller] = consented
+    set_consent(caller, consented)
     log_event("sms_opt_in", caller=caller, consented=consented, digits_received=digits)
 
     vr = VoiceResponse()
@@ -168,6 +275,7 @@ def voice_opt_in():
 # If it wasn't answered, text the caller immediately.
 # ---------------------------------------------------------------------
 @app.route("/voice/status", methods=["POST"])
+@validate_twilio_request
 def voice_status():
     caller = request.form.get("From", "unknown")
     call_status = request.form.get("DialCallStatus", "unknown")
@@ -175,7 +283,7 @@ def voice_status():
 
     vr = VoiceResponse()
     if call_status in ("no-answer", "busy", "failed", "canceled"):
-        if SMS_CONSENT.get(caller):
+        if has_consent(caller):
             body = (
                 f"Hey! Sorry we missed your call at {BUSINESS_NAME}. "
                 f"What can we help with? (Reply here and we'll get right back to you.)"
@@ -192,6 +300,7 @@ def voice_status():
 # SMS: incoming text -> AI reply -> text back
 # ---------------------------------------------------------------------
 @app.route("/sms", methods=["POST"])
+@validate_twilio_request
 def sms():
     caller = request.form.get("From", "unknown")
     body = request.form.get("Body", "")

@@ -20,7 +20,7 @@ import os
 import datetime
 import logging
 from flask import Flask, request, Response
-from twilio.twiml.voice_response import VoiceResponse, Dial
+from twilio.twiml.voice_response import VoiceResponse, Dial, Gather
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from anthropic import Anthropic
@@ -51,6 +51,17 @@ logging.basicConfig(
 # In-memory store of conversation history per caller, for this demo.
 # A real deployment would use a database (SQLite/Postgres) instead.
 CONVERSATIONS: dict[str, list[dict]] = {}
+
+# In-memory store of whether a caller pressed 1 to opt in to SMS follow-up,
+# keyed by their phone number. A real deployment would persist this
+# (SQLite/Postgres) rather than lose it on restart.
+SMS_CONSENT: dict[str, bool] = {}
+
+OPT_IN_PROMPT = (
+    f"Thanks for calling {BUSINESS_NAME}. Press 1 to opt in to receive a "
+    "follow-up text message if we're unable to answer your call right now. "
+    "Message and data rates may apply."
+)
 
 SYSTEM_PROMPT = f"""You are the friendly, efficient text-message assistant for \
 {BUSINESS_NAME}. {BUSINESS_NAME} sells AI missed-call recovery (this exact system — \
@@ -121,12 +132,33 @@ def voice():
     caller = request.form.get("From", "unknown")
     log_event("incoming_call", caller=caller)
 
+    # Explicit opt-in: caller must press 1 before we'll text them later if
+    # the call goes unanswered. This is required for A2P 10DLC compliance —
+    # "by continuing the call" is not an explicit consent action on its own.
     vr = VoiceResponse()
-    vr.say(
-        "Thanks for calling ColdFront Studio. If we're unable to answer, "
-        "you'll receive a text message to follow up. By continuing this call, "
-        "you agree to receive that message. Message and data rates may apply."
+    gather = Gather(
+        num_digits=1,
+        timeout=6,
+        action=f"{PUBLIC_BASE_URL}/voice/opt-in",
+        method="POST",
+        action_on_empty_result=True,
     )
+    gather.say(OPT_IN_PROMPT)
+    vr.append(gather)
+    # Safety net in case Gather's action callback itself never fires.
+    vr.redirect(f"{PUBLIC_BASE_URL}/voice/opt-in")
+    return Response(str(vr), mimetype="text/xml")
+
+
+@app.route("/voice/opt-in", methods=["POST"])
+def voice_opt_in():
+    caller = request.form.get("From", "unknown")
+    digits = request.form.get("Digits", "")
+    consented = digits.strip() == "1"
+    SMS_CONSENT[caller] = consented
+    log_event("sms_opt_in", caller=caller, consented=consented, digits_received=digits)
+
+    vr = VoiceResponse()
     if FORWARD_TO:
         dial = Dial(
             timeout=RING_TIMEOUT_SECONDS,
@@ -137,8 +169,7 @@ def voice():
         vr.append(dial)
     else:
         # No forwarding number configured — go straight to voicemail-style message.
-        vr.say("Thanks for calling. We can't take your call right now, "
-               "but we'll text you in just a moment.")
+        vr.say("Thanks for calling. We can't take your call right now.")
         vr.redirect(f"{PUBLIC_BASE_URL}/voice/status?DialCallStatus=no-answer")
     return Response(str(vr), mimetype="text/xml")
 
@@ -155,15 +186,17 @@ def voice_status():
 
     vr = VoiceResponse()
     if call_status in ("no-answer", "busy", "failed", "canceled"):
-        body = (
-            f"Hey! Sorry we missed your call at {BUSINESS_NAME} — and yes, this "
-            f"text is the product. What's your business name and trade? "
-            f"I'll get you a personalized demo."
-        )
-        send_sms(caller, body)
-        log_event("missed_call_text_sent", caller=caller)
-    else:
-        vr.hangup()
+        if SMS_CONSENT.get(caller):
+            body = (
+                f"Hey! Sorry we missed your call at {BUSINESS_NAME} — and yes, this "
+                f"text is the product. What's your business name and trade? "
+                f"I'll get you a personalized demo."
+            )
+            send_sms(caller, body)
+            log_event("missed_call_text_sent", caller=caller)
+        else:
+            log_event("missed_call_no_consent_skipped", caller=caller)
+    vr.hangup()
     return Response(str(vr), mimetype="text/xml")
 
 

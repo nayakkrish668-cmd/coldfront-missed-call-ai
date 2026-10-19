@@ -14,6 +14,18 @@ What this does:
 
 This is a demo-grade template, not a production system — see README.md
 for what to harden before using it with a real client's phone number.
+
+Also included: a standalone LIVE VOICE DEMO (/voice/demo) a prospect can
+call and actually talk to, out loud, in real time. It's a separate code
+path from the real missed-call-text-back product above, needs no SMS/A2P
+approval (voice calls aren't gated by 10DLC), and supports two framings
+picked via a ?mode= query param on the Twilio webhook URL:
+  - /voice/demo?mode=lead   -> "never miss a job" lead-capture receptionist
+  - /voice/demo?mode=screen -> "stop wasting time on sales calls" gatekeeper
+Point any Twilio number's "A call comes in" webhook at one of those two
+URLs to turn the demo on for that number. Each call's conversation is
+kept in memory only (not the SQLite tables used by the real product) and
+is capped at a few turns so a stray demo call can't run up an API bill.
 """
 
 import os
@@ -216,6 +228,178 @@ def ai_reply(caller: str, incoming_text: str) -> str:
 
     append_message(caller, "assistant", reply_text)
     return reply_text
+
+
+# ---------------------------------------------------------------------
+# LIVE VOICE DEMO — a prospect calls in and talks to the AI out loud,
+# in real time. Separate from the real product's SQLite-backed history;
+# kept in a plain in-memory dict since a demo call never needs to survive
+# a worker restart, and we don't want prospect demo chatter mixed into
+# the real customer consent/message tables above.
+# ---------------------------------------------------------------------
+MAX_DEMO_TURNS = 6  # caps a stray/looping call so it can't run up the API bill
+
+_demo_sessions: dict[str, list[dict]] = {}
+_demo_empty_streak: dict[str, int] = {}
+
+DEMO_GREETINGS = {
+    "lead": (
+        f"Hi! This is a live demo of {BUSINESS_NAME}'s AI phone receptionist, "
+        "built by ColdFront Studio. Go ahead and talk to me like you're a "
+        "customer calling in — what can I help you with today?"
+    ),
+    "screen": (
+        "Hi, thanks for calling! Before I put you through, can I ask — "
+        "what's the purpose of your call today?"
+    ),
+}
+
+DEMO_SYSTEM_PROMPTS = {
+    "lead": f"""You are a LIVE VOICE DEMO of an AI phone receptionist for \
+{BUSINESS_TRADE} businesses, built by ColdFront Studio. The person on the \
+line is a prospective customer trying the demo out loud over a real phone \
+call, not an actual customer needing service — but play it straight, as if \
+you were answering a real call for a {BUSINESS_TRADE} business, so they can \
+hear how it would actually sound.
+- Greet-and-ask has already happened; respond to what they say next
+- Ask what they need (repair, quote, emergency, etc.), as a real receptionist would
+- Try to gather: their name, a short description of the issue, and a preferred day/time
+- Keep every reply SHORT and natural (1-2 sentences) — this is spoken out loud, not read
+- If they ask what this is or how it works, briefly explain: this is a live demo of an \
+AI receptionist that answers calls and can also text back anyone who calls when the \
+business can't pick up
+- Never make up a price, availability, or promise a specific technician
+- If they say goodbye, thanks, or that's all, end warmly in one short sentence""",
+    "screen": """You are a LIVE VOICE DEMO of an AI call-screening receptionist, built \
+by ColdFront Studio, showing how it protects a busy small-business owner from unwanted \
+sales and spam calls. The person on the line is a prospect trying the demo out loud over \
+a real phone call. Play it straight, as the AI gatekeeper really would:
+- You've already asked the purpose of their call; respond to what they say next
+- If they say they're selling something, a vendor, marketing, or a cold call: politely \
+decline to transfer them, explain the owner isn't taking sales calls right now, and offer \
+to take a short message instead
+- If they say they're a customer needing service, or anything that's clearly not a sales \
+pitch: respond warmly and say you'd transfer them right through (for the demo, just say \
+what you WOULD do, don't actually try to transfer)
+- Keep every reply SHORT and natural (1-2 sentences) — this is spoken out loud, not read
+- If they ask what this is or how it works, briefly explain: this screens incoming calls \
+so the owner only gets interrupted for real customers, not sales pitches
+- If they say goodbye, thanks, or that's all, end warmly in one short sentence""",
+}
+
+DEMO_CLOSING_LINE = (
+    "That's the demo! Thanks for trying it out — have a great day."
+)
+
+
+def _demo_mode() -> str:
+    mode = request.args.get("mode", "lead").strip().lower()
+    return mode if mode in DEMO_SYSTEM_PROMPTS else "lead"
+
+
+def _demo_ai_reply(call_sid: str, mode: str, caller_said: str) -> str:
+    history = _demo_sessions.setdefault(call_sid, [])
+    history.append({"role": "user", "content": caller_said})
+
+    if ai_client:
+        resp = ai_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=120,
+            system=DEMO_SYSTEM_PROMPTS[mode],
+            messages=history,
+        )
+        reply_text = resp.content[0].text
+    else:
+        reply_text = (
+            "Thanks! I'd note that down for a real call, but the AI isn't fully "
+            "configured yet on this demo — ANTHROPIC_API_KEY needs to be set."
+        )
+
+    history.append({"role": "assistant", "content": reply_text})
+    return reply_text
+
+
+def _demo_gather(mode: str) -> Gather:
+    return Gather(
+        input="speech",
+        speech_timeout="auto",
+        action=f"{PUBLIC_BASE_URL}/voice/demo/respond?mode={mode}",
+        method="POST",
+        action_on_empty_result=True,
+    )
+
+
+@app.route("/voice/demo", methods=["POST"])
+@validate_twilio_request
+def voice_demo():
+    call_sid = request.form.get("CallSid", "unknown")
+    mode = _demo_mode()
+    log_event("demo_call_started", call_sid=call_sid, mode=mode)
+
+    _demo_sessions[call_sid] = []
+    _demo_empty_streak[call_sid] = 0
+
+    vr = VoiceResponse()
+    gather = _demo_gather(mode)
+    gather.say(DEMO_GREETINGS[mode])
+    vr.append(gather)
+    # If Gather's own action callback never fires, don't just hang silently.
+    vr.say("Didn't catch that — thanks for trying the demo, bye for now!")
+    vr.hangup()
+    return Response(str(vr), mimetype="text/xml")
+
+
+@app.route("/voice/demo/respond", methods=["POST"])
+@validate_twilio_request
+def voice_demo_respond():
+    call_sid = request.form.get("CallSid", "unknown")
+    mode = _demo_mode()
+    caller_said = request.form.get("SpeechResult", "").strip()
+    turns_so_far = len(_demo_sessions.get(call_sid, []))
+
+    vr = VoiceResponse()
+
+    if not caller_said:
+        streak = _demo_empty_streak.get(call_sid, 0) + 1
+        _demo_empty_streak[call_sid] = streak
+        if streak >= 2:
+            log_event("demo_call_ended_silence", call_sid=call_sid)
+            vr.say(DEMO_CLOSING_LINE)
+            vr.hangup()
+        else:
+            gather = _demo_gather(mode)
+            gather.say("Sorry, I didn't catch that — go ahead, I'm listening.")
+            vr.append(gather)
+            vr.say(DEMO_CLOSING_LINE)
+            vr.hangup()
+        return Response(str(vr), mimetype="text/xml")
+
+    _demo_empty_streak[call_sid] = 0
+    log_event("demo_caller_said", call_sid=call_sid, mode=mode, text=caller_said)
+
+    sign_off_words = ("bye", "goodbye", "that's all", "thats all", "no thanks", "nothing else")
+    wants_to_end = any(w in caller_said.lower() for w in sign_off_words)
+
+    if turns_so_far >= MAX_DEMO_TURNS * 2 or wants_to_end:
+        if not wants_to_end:
+            reply_text = _demo_ai_reply(call_sid, mode, caller_said)
+            vr.say(reply_text)
+        vr.say(DEMO_CLOSING_LINE)
+        vr.hangup()
+        log_event("demo_call_ended", call_sid=call_sid, reason="sign_off_or_cap")
+        _demo_sessions.pop(call_sid, None)
+        _demo_empty_streak.pop(call_sid, None)
+        return Response(str(vr), mimetype="text/xml")
+
+    reply_text = _demo_ai_reply(call_sid, mode, caller_said)
+    log_event("demo_ai_reply", call_sid=call_sid, reply=reply_text)
+
+    gather = _demo_gather(mode)
+    gather.say(reply_text)
+    vr.append(gather)
+    vr.say(DEMO_CLOSING_LINE)
+    vr.hangup()
+    return Response(str(vr), mimetype="text/xml")
 
 
 # ---------------------------------------------------------------------

@@ -60,10 +60,9 @@ ai_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 request_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
 
 logging.basicConfig(
-    filename="events.log",
     level=logging.INFO,
     format="%(asctime)s %(message)s",
-)
+)  # stdout, so Render's log dashboard actually shows these events
 
 # ---------------------------------------------------------------------
 # Storage: SQLite instead of in-memory dicts, so consent records and
@@ -462,7 +461,11 @@ def voice_opt_in():
 @validate_twilio_request
 def voice_status():
     caller = request.form.get("From", "unknown")
-    call_status = request.form.get("DialCallStatus", "unknown")
+    # DialCallStatus normally arrives as a POST form field (Twilio's own
+    # <Dial action=...> callback does this). But the no-FORWARD_TO fallback
+    # above redirects here with it as a URL query param instead, which
+    # request.form can't see — use request.values so both paths work.
+    call_status = request.values.get("DialCallStatus", "unknown")
     log_event("call_status", caller=caller, status=call_status)
 
     vr = VoiceResponse()

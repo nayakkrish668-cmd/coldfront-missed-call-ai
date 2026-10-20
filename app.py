@@ -39,7 +39,7 @@ from twilio.twiml.voice_response import VoiceResponse, Dial, Gather
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client
-from anthropic import Anthropic
+from anthropic import Anthropic, APIError
 
 app = Flask(__name__)
 
@@ -228,13 +228,25 @@ def ai_reply(caller: str, incoming_text: str) -> str:
     history = get_history(caller)
 
     if ai_client:
-        resp = ai_client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=200,
-            system=SYSTEM_PROMPT,
-            messages=history,
-        )
-        reply_text = resp.content[0].text
+        try:
+            resp = ai_client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=200,
+                system=SYSTEM_PROMPT,
+                messages=history,
+            )
+            reply_text = resp.content[0].text
+        except APIError as exc:
+            # Anthropic being down, rate-limited, or out of credits must
+            # never surface as a raw 500 — that's what gets a real customer
+            # "application error occurred" mid-conversation. Log it and
+            # still text back something useful.
+            log_event("ai_reply_failed", caller=caller, error=str(exc))
+            reply_text = (
+                "Thanks for your message! We're having a brief technical "
+                "hiccup on our end — someone from our team will follow up "
+                "with you shortly."
+            )
     else:
         # Fallback so the demo still works without an API key configured yet.
         reply_text = (
@@ -319,13 +331,22 @@ def _demo_ai_reply(call_sid: str, mode: str, caller_said: str) -> str:
     history.append({"role": "user", "content": caller_said})
 
     if ai_client:
-        resp = ai_client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=120,
-            system=DEMO_SYSTEM_PROMPTS[mode],
-            messages=history,
-        )
-        reply_text = resp.content[0].text
+        try:
+            resp = ai_client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=120,
+                system=DEMO_SYSTEM_PROMPTS[mode],
+                messages=history,
+            )
+            reply_text = resp.content[0].text
+        except APIError as exc:
+            # A crash here would bring down a live voice call mid-sentence —
+            # worse than a bad reply, since the caller is on the line right now.
+            log_event("demo_ai_reply_failed", call_sid=call_sid, error=str(exc))
+            reply_text = (
+                "Sorry, I'm having a brief technical hiccup — but that's the "
+                "idea: this demo answers calls and texts back anyone we miss."
+            )
     else:
         reply_text = (
             "Thanks! I'd note that down for a real call, but the AI isn't fully "

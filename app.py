@@ -55,6 +55,23 @@ BUSINESS_NAME = os.environ.get("BUSINESS_NAME", "ABC Home Services")
 BUSINESS_TRADE = os.environ.get("BUSINESS_TRADE", "HVAC repair and installation")
 RING_TIMEOUT_SECONDS = int(os.environ.get("RING_TIMEOUT_SECONDS", "18"))
 
+# Number the AI tells a texting customer to call for a true emergency.
+# Defaults to the business's own Twilio number (which already forwards to
+# FORWARD_TO) so there's never a placeholder like ###-###-#### in a live
+# reply; override with EMERGENCY_PHONE if it should ring somewhere else.
+EMERGENCY_PHONE = os.environ.get("EMERGENCY_PHONE", "") or TWILIO_NUMBER
+
+
+def _format_phone_for_display(e164: str) -> str:
+    """+17068082127 -> (706) 808-2127. Falls back to the raw value for
+    anything that isn't a plain 11-digit US/Canada number."""
+    digits = e164.lstrip("+")
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        return f"({digits[0:3]}) {digits[3:6]}-{digits[6:]}"
+    return e164 or "our main number"
+
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID else None
 ai_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 request_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
@@ -190,7 +207,8 @@ confirm pricing on the visit)
 someone will follow up shortly to finalize the appointment
 - Keep every reply SHORT (1-3 sentences) — this is a text conversation, not an email
 - If it sounds like a true emergency (gas leak, no heat in freezing weather, water \
-flooding), tell them to call ###-###-#### directly right now instead of texting
+flooding), tell them to call {_format_phone_for_display(EMERGENCY_PHONE)} directly \
+right now instead of texting
 Never make up a price, availability, or promise a specific technician."""
 
 

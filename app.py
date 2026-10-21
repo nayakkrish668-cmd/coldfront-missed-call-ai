@@ -29,13 +29,14 @@ is capped at a few turns so a stray demo call can't run up an API bill.
 """
 
 import os
-import secrets
+import time
 import sqlite3
 import datetime
 import logging
 from contextlib import closing
 from functools import wraps
 from flask import Flask, request, Response, abort
+from werkzeug.security import generate_password_hash, check_password_hash
 from twilio.twiml.voice_response import VoiceResponse, Dial, Gather
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
@@ -63,11 +64,18 @@ RING_TIMEOUT_SECONDS = int(os.environ.get("RING_TIMEOUT_SECONDS", "18"))
 # reply; override with EMERGENCY_PHONE if it should ring somewhere else.
 EMERGENCY_PHONE = os.environ.get("EMERGENCY_PHONE", "") or TWILIO_NUMBER
 
-# Login for the /admin/clients onboarding page below (HTTP Basic Auth —
-# your browser will prompt for these, nothing to paste into a URL). Set
-# both on Render. If ADMIN_PASSWORD is unset, the page refuses all access.
+# Login for the /admin pages below (HTTP Basic Auth — your browser will
+# prompt for these, nothing to paste into a URL). These two env vars only
+# seed the FIRST admin account, on first run — after that, admin accounts
+# (there can be more than one) live in the admin_users table below, managed
+# from /admin/users, so a second person can get their own revocable login
+# instead of everyone sharing these credentials. If ADMIN_PASSWORD is unset
+# and no admin account exists yet, every /admin page refuses all access.
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCKOUT_SECONDS = 300  # 5 minutes
 
 # These env vars describe ONE business — kept as the fallback "default
 # client" so the very first deployment needs zero database rows. Onboarding
@@ -165,10 +173,36 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def ensure_bootstrap_admin():
+    """If no admin account exists yet, seed one from ADMIN_USERNAME /
+    ADMIN_PASSWORD so the very first login never needs a DB row — matches
+    how client onboarding falls back to env vars until a real row exists."""
+    if not ADMIN_PASSWORD:
+        return
+    with closing(get_db()) as conn:
+        if conn.execute("SELECT 1 FROM admin_users LIMIT 1").fetchone():
+            return
+        conn.execute(
+            "INSERT OR IGNORE INTO admin_users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            (ADMIN_USERNAME, generate_password_hash(ADMIN_PASSWORD), datetime.datetime.utcnow().isoformat()),
+        )
         conn.commit()
 
 
 init_db()
+ensure_bootstrap_admin()
 
 
 def set_consent(phone: str, consented: bool):
@@ -303,6 +337,74 @@ def resolve_client(to_number: str) -> dict:
         "emergency_phone": row["emergency_phone"] or row["twilio_number"],
         "ring_timeout_seconds": row["ring_timeout_seconds"] or RING_TIMEOUT_SECONDS,
     }
+
+
+# ---------------------------------------------------------------------
+# Admin accounts (separate from clients). Letting more than one named
+# login exist means a second person can be handed their own credential —
+# and have it revoked individually — instead of everyone sharing one
+# password that can only ever be rotated for the whole group at once.
+# ---------------------------------------------------------------------
+def get_admin_password_hash(username: str):
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT password_hash FROM admin_users WHERE username = ?", (username,)
+        ).fetchone()
+        return row["password_hash"] if row else None
+
+
+def list_admin_users() -> list[dict]:
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT username, created_at FROM admin_users ORDER BY username COLLATE NOCASE"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def upsert_admin_user(username: str, password: str):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO admin_users (username, password_hash, created_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(username) DO UPDATE SET password_hash=excluded.password_hash",
+            (username, generate_password_hash(password), datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def delete_admin_user(username: str):
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM admin_users WHERE username = ?", (username,))
+        conn.commit()
+
+
+# ---------------------------------------------------------------------
+# Login rate limiting. In-memory and per-process, which is fine here since
+# this service runs a single gunicorn worker (WEB_CONCURRENCY=1) — it just
+# needs to turn "guess the password" from unlimited attempts into a
+# handful per 5-minute window, not survive a restart.
+# ---------------------------------------------------------------------
+_failed_logins: dict[str, list[float]] = {}
+
+
+def _login_rate_limit_key() -> str:
+    # X-Forwarded-For first, since Render sits in front of the app as a proxy.
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return (forwarded.split(",")[0].strip() if forwarded else request.remote_addr) or "unknown"
+
+
+def _is_locked_out(key: str) -> bool:
+    now = time.time()
+    recent = [t for t in _failed_logins.get(key, []) if now - t < LOGIN_LOCKOUT_SECONDS]
+    _failed_logins[key] = recent
+    return len(recent) >= MAX_LOGIN_ATTEMPTS
+
+
+def _record_failed_login(key: str):
+    _failed_logins.setdefault(key, []).append(time.time())
+
+
+def _record_successful_login(key: str):
+    _failed_logins.pop(key, None)
 
 
 def validate_twilio_request(f):
@@ -771,29 +873,34 @@ def sms():
 
 
 # ---------------------------------------------------------------------
-# Admin: onboard/update/remove a client without touching code or env vars.
-# Protected by HTTP Basic Auth (ADMIN_USERNAME / ADMIN_PASSWORD) rather than
-# a secret baked into the URL — a URL-embedded secret ends up in browser
-# history, can get logged by intermediate services, and is easy to leak by
-# pasting the link somewhere. Basic Auth keeps the credential in a login
-# prompt instead, and constant-time comparison avoids leaking the password
-# one byte at a time via response-timing differences.
+# Admin: onboard/update/remove a client without touching code or env vars,
+# and manage who's allowed to do that. Protected by HTTP Basic Auth against
+# the admin_users table rather than a secret baked into the URL — a
+# URL-embedded secret ends up in browser history, can get logged by
+# intermediate services, and is easy to leak by pasting the link somewhere.
+# Basic Auth keeps the credential in a login prompt instead, passwords are
+# hashed at rest (never stored or compared as plaintext), and a handful of
+# wrong guesses locks out that source for a few minutes.
 # ---------------------------------------------------------------------
 def require_admin_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
+        rl_key = _login_rate_limit_key()
+        if _is_locked_out(rl_key):
+            log_event("admin_login_locked_out", source=rl_key)
+            return Response("Too many failed login attempts. Try again in a few minutes.", 429)
+
         auth = request.authorization
-        ok = bool(
-            ADMIN_PASSWORD
-            and auth
-            and secrets.compare_digest(auth.username or "", ADMIN_USERNAME)
-            and secrets.compare_digest(auth.password or "", ADMIN_PASSWORD)
-        )
+        password_hash = get_admin_password_hash(auth.username) if auth else None
+        ok = bool(auth and password_hash and check_password_hash(password_hash, auth.password or ""))
+
         if not ok:
+            _record_failed_login(rl_key)
             return Response(
                 "Login required.", 401,
                 {"WWW-Authenticate": 'Basic realm="ColdFront admin"'},
             )
+        _record_successful_login(rl_key)
         return f(*args, **kwargs)
 
     return decorated
@@ -861,7 +968,9 @@ label{{display:block;margin-top:.8rem;font-weight:600;font-size:.9rem}}
 input{{width:100%;padding:.5rem;box-sizing:border-box;margin-top:.2rem}}
 button{{margin-top:1rem;padding:.6rem 1.2rem;cursor:pointer}}
 .msg{{background:#e6f4ea;padding:.6rem .8rem;border-radius:4px;margin-bottom:1rem}}
+nav a{{font-size:.85rem;color:#555}}
 </style></head><body>
+<nav><a href="/admin/users">Manage admin logins &rarr;</a></nav>
 <h1>Clients</h1>
 {'<p class="msg">' + message + '</p>' if message else ''}
 <table><tr><th>Business</th><th>Twilio #</th><th>Trade</th><th>Forward to</th><th>Emergency #</th><th></th></tr>
@@ -882,6 +991,78 @@ button{{margin-top:1rem;padding:.6rem 1.2rem;cursor:pointer}}
 <label>Ring timeout, seconds (optional — defaults to {RING_TIMEOUT_SECONDS})</label>
 <input name="ring_timeout_seconds">
 <button type="submit">Save client</button>
+</form>
+</body></html>"""
+
+
+# ---------------------------------------------------------------------
+# Admin: manage who can log into /admin. Each admin gets their own
+# username/password (hashed, never stored or shown in plaintext) so access
+# can be granted or revoked for one person without rotating a shared
+# password everyone else would also have to re-enter.
+# ---------------------------------------------------------------------
+@app.route("/admin/users", methods=["GET", "POST"])
+@require_admin_auth
+def admin_users_page():
+    message = ""
+
+    if request.method == "POST":
+        action = request.form.get("action", "save")
+        username = request.form.get("username", "").strip()
+        existing = list_admin_users()
+
+        if action == "delete":
+            if len(existing) <= 1:
+                message = "Can't remove the last remaining admin account — you'd lock everyone out."
+            elif username:
+                delete_admin_user(username)
+                message = f"Removed admin login '{username}'."
+        else:
+            password = request.form.get("password", "")
+            if not username or len(password) < 8:
+                message = "Username is required and password must be at least 8 characters."
+            else:
+                upsert_admin_user(username, password)
+                message = f"Saved admin login '{username}'."
+
+    admins = list_admin_users()
+    can_remove = len(admins) > 1
+    rows_html = "".join(
+        f"""<tr>
+            <td>{a['username']}</td><td>{a['created_at'][:10]}</td>
+            <td><form method="POST" style="display:inline" onsubmit="return confirm('Remove admin login for {a['username']}?')">
+                <input type="hidden" name="action" value="delete">
+                <input type="hidden" name="username" value="{a['username']}">
+                <button type="submit" {'disabled' if not can_remove else ''}>Remove</button></form></td>
+        </tr>"""
+        for a in admins
+    )
+
+    return f"""<html><head><title>Admin logins</title>
+<style>
+body{{font-family:-apple-system,sans-serif;max-width:600px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}}
+table{{width:100%;border-collapse:collapse;margin-bottom:2rem;font-size:.85rem}}
+td,th{{border:1px solid #ddd;padding:.5rem .6rem;text-align:left}}
+th{{background:#f5f5f5}}
+label{{display:block;margin-top:.8rem;font-weight:600;font-size:.9rem}}
+input{{width:100%;padding:.5rem;box-sizing:border-box;margin-top:.2rem}}
+button{{margin-top:1rem;padding:.6rem 1.2rem;cursor:pointer}}
+.msg{{background:#e6f4ea;padding:.6rem .8rem;border-radius:4px;margin-bottom:1rem}}
+nav a{{font-size:.85rem;color:#555}}
+</style></head><body>
+<nav><a href="/admin/clients">&larr; Back to clients</a></nav>
+<h1>Admin logins</h1>
+<p style="font-size:.85rem;color:#555">Each row below is its own username/password — add one per person who needs
+access, and remove a row the moment someone shouldn't have it anymore instead of changing a password everyone shares.</p>
+{'<p class="msg">' + message + '</p>' if message else ''}
+<table><tr><th>Username</th><th>Added</th><th></th></tr>{rows_html}</table>
+<h2>Add / update an admin login</h2>
+<form method="POST">
+<label>Username</label>
+<input name="username" required>
+<label>Password (at least 8 characters)</label>
+<input name="password" type="password" required minlength="8">
+<button type="submit">Save login</button>
 </form>
 </body></html>"""
 

@@ -62,6 +62,23 @@ RING_TIMEOUT_SECONDS = int(os.environ.get("RING_TIMEOUT_SECONDS", "18"))
 # reply; override with EMERGENCY_PHONE if it should ring somewhere else.
 EMERGENCY_PHONE = os.environ.get("EMERGENCY_PHONE", "") or TWILIO_NUMBER
 
+# Shared secret for the /admin/clients onboarding page below. Set this on
+# Render (same as the other env vars) — the page is unreachable without it.
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
+
+# These env vars describe ONE business — kept as the fallback "default
+# client" so the very first deployment needs zero database rows. Onboarding
+# client #2 and beyond is done through /admin/clients instead (see below),
+# so adding a new client never requires editing code or redeploying.
+DEFAULT_CLIENT = {
+    "twilio_number": TWILIO_NUMBER,
+    "business_name": BUSINESS_NAME,
+    "business_trade": BUSINESS_TRADE,
+    "forward_to": FORWARD_TO,
+    "emergency_phone": EMERGENCY_PHONE,
+    "ring_timeout_seconds": RING_TIMEOUT_SECONDS,
+}
+
 
 def _format_phone_for_display(e164: str) -> str:
     """+17068082127 -> (706) 808-2127. Falls back to the raw value for
@@ -131,6 +148,20 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS clients (
+                twilio_number TEXT PRIMARY KEY,
+                business_name TEXT NOT NULL,
+                business_trade TEXT NOT NULL,
+                forward_to TEXT NOT NULL,
+                emergency_phone TEXT,
+                ring_timeout_seconds INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -187,6 +218,90 @@ def mark_owner_notified(phone: str):
         conn.commit()
 
 
+# ---------------------------------------------------------------------
+# Per-client config. Each real client gets their own Twilio number; the
+# "To" field Twilio sends on every webhook (call or text) IS that number,
+# so it doubles as the lookup key for which business's name/trade/forward
+# number/emergency number to use on that request. Onboarding client #2+ is
+# then just a row in this table via /admin/clients below — no code change,
+# no redeploy. If no row matches, we fall back to DEFAULT_CLIENT (the
+# env-var-configured business), so the current single-client setup keeps
+# working untouched.
+# ---------------------------------------------------------------------
+def get_client_row(twilio_number: str):
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM clients WHERE twilio_number = ?", (twilio_number,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_clients() -> list[dict]:
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM clients ORDER BY business_name COLLATE NOCASE"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def upsert_client(
+    twilio_number: str,
+    business_name: str,
+    business_trade: str,
+    forward_to: str,
+    emergency_phone: str | None = None,
+    ring_timeout_seconds: int | None = None,
+):
+    now = datetime.datetime.utcnow().isoformat()
+    with closing(get_db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO clients
+                (twilio_number, business_name, business_trade, forward_to,
+                 emergency_phone, ring_timeout_seconds, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(twilio_number) DO UPDATE SET
+                business_name=excluded.business_name,
+                business_trade=excluded.business_trade,
+                forward_to=excluded.forward_to,
+                emergency_phone=excluded.emergency_phone,
+                ring_timeout_seconds=excluded.ring_timeout_seconds,
+                updated_at=excluded.updated_at
+            """,
+            (
+                twilio_number,
+                business_name,
+                business_trade,
+                forward_to,
+                emergency_phone,
+                ring_timeout_seconds,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+
+def delete_client(twilio_number: str):
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM clients WHERE twilio_number = ?", (twilio_number,))
+        conn.commit()
+
+
+def resolve_client(to_number: str) -> dict:
+    row = get_client_row(to_number) if to_number else None
+    if not row:
+        return DEFAULT_CLIENT
+    return {
+        "twilio_number": row["twilio_number"],
+        "business_name": row["business_name"],
+        "business_trade": row["business_trade"],
+        "forward_to": row["forward_to"],
+        "emergency_phone": row["emergency_phone"] or row["twilio_number"],
+        "ring_timeout_seconds": row["ring_timeout_seconds"] or RING_TIMEOUT_SECONDS,
+    }
+
+
 def validate_twilio_request(f):
     """Reject any request to a Twilio webhook that isn't actually signed by
     Twilio. Without this, anyone who finds the URL can POST fake call/SMS
@@ -216,14 +331,17 @@ def validate_twilio_request(f):
     return decorated
 
 
-OPT_IN_PROMPT = (
-    f"Thanks for calling {BUSINESS_NAME}. Press 1 to opt in to receive a "
-    "follow-up text message if we're unable to answer your call right now. "
-    "Message and data rates may apply."
-)
+def build_opt_in_prompt(client: dict) -> str:
+    return (
+        f"Thanks for calling {client['business_name']}. Press 1 to opt in to receive a "
+        "follow-up text message if we're unable to answer your call right now. "
+        "Message and data rates may apply."
+    )
 
-SYSTEM_PROMPT = f"""You are the friendly, efficient text-message assistant for \
-{BUSINESS_NAME}, a {BUSINESS_TRADE} business. A customer just texted in, likely \
+
+def build_system_prompt(client: dict) -> str:
+    return f"""You are the friendly, efficient text-message assistant for \
+{client['business_name']}, a {client['business_trade']} business. A customer just texted in, likely \
 after a call wasn't answered. Your job:
 - Greet them briefly and find out what they need (repair, quote, emergency, etc.)
 - Answer simple questions (you don't know exact pricing — say a technician will \
@@ -237,7 +355,7 @@ you actually have real values (never call it with guessed or placeholder info).
 it to the team to schedule and that someone will follow up shortly
 - Keep every reply SHORT (1-3 sentences) — this is a text conversation, not an email
 - If it sounds like a true emergency (gas leak, no heat in freezing weather, water \
-flooding), tell them to call {_format_phone_for_display(EMERGENCY_PHONE)} directly \
+flooding), tell them to call {_format_phone_for_display(client['emergency_phone'])} directly \
 right now instead of texting
 Never make up a price, availability, or promise a specific technician."""
 
@@ -276,36 +394,37 @@ def log_event(kind: str, **fields):
     logging.info("%s | %s", kind, fields)
 
 
-def send_sms(to: str, body: str):
+def send_sms(to: str, body: str, from_number: str):
     if not twilio_client:
-        print(f"[DRY RUN] Would text {to}: {body}")
+        print(f"[DRY RUN] Would text {to} from {from_number}: {body}")
         return
-    twilio_client.messages.create(to=to, from_=TWILIO_NUMBER, body=body)
+    twilio_client.messages.create(to=to, from_=from_number, body=body)
 
 
-def notify_owner_of_lead(caller: str, lead: dict):
-    """Text FORWARD_TO a summary of a captured lead, at most once per phone
-    number. This is the thing that actually gets a real business owner's
-    attention — without it, a captured lead just sits in a SQLite table
-    nobody is looking at."""
+def notify_owner_of_lead(caller: str, lead: dict, client: dict):
+    """Text the client's forward_to number a summary of a captured lead, at
+    most once per phone number. This is the thing that actually gets a real
+    business owner's attention — without it, a captured lead just sits in a
+    SQLite table nobody is looking at."""
     if already_notified_owner(caller):
         return
-    if not FORWARD_TO:
-        log_event("lead_captured_no_forward_to", caller=caller, lead=lead)
+    forward_to = client["forward_to"]
+    if not forward_to:
+        log_event("lead_captured_no_forward_to", caller=caller, lead=lead, business=client["business_name"])
         mark_owner_notified(caller)
         return
 
     urgency = lead.get("urgency", "normal")
     tag = "🚨 EMERGENCY LEAD" if urgency == "emergency" else "🔔 New lead"
     body = (
-        f"{tag} via AI text-back\n"
+        f"{tag} via AI text-back ({client['business_name']})\n"
         f"From: {_format_phone_for_display(caller)}\n"
         f"Name: {lead.get('customer_name', '—')}\n"
         f"Needs: {lead.get('issue_description', '—')}\n"
         f"Preferred time: {lead.get('preferred_time', '—')}"
     )
     try:
-        send_sms(FORWARD_TO, body)
+        send_sms(forward_to, body, client["twilio_number"])
         log_event("owner_notified", caller=caller, lead=lead)
     except TwilioException as exc:
         # Never let a failed owner-notification crash the customer's reply —
@@ -314,7 +433,7 @@ def notify_owner_of_lead(caller: str, lead: dict):
     mark_owner_notified(caller)
 
 
-def ai_reply(caller: str, incoming_text: str) -> str:
+def ai_reply(caller: str, incoming_text: str, client: dict) -> str:
     append_message(caller, "user", incoming_text)
     history = get_history(caller)
 
@@ -323,7 +442,7 @@ def ai_reply(caller: str, incoming_text: str) -> str:
             resp = ai_client.messages.create(
                 model="claude-sonnet-4-5",
                 max_tokens=300,
-                system=SYSTEM_PROMPT,
+                system=build_system_prompt(client),
                 tools=[CAPTURE_LEAD_TOOL],
                 messages=history,
             )
@@ -332,7 +451,7 @@ def ai_reply(caller: str, incoming_text: str) -> str:
                 if block.type == "text":
                     reply_text += block.text
                 elif block.type == "tool_use" and block.name == "capture_lead":
-                    notify_owner_of_lead(caller, block.input)
+                    notify_owner_of_lead(caller, block.input, client)
             reply_text = reply_text.strip() or (
                 "Thanks — I've got what I need and I'm passing it to the team now!"
             )
@@ -547,7 +666,9 @@ def voice_demo_respond():
 @validate_twilio_request
 def voice():
     caller = request.form.get("From", "unknown")
-    log_event("incoming_call", caller=caller)
+    to_number = request.form.get("To", "")
+    client = resolve_client(to_number)
+    log_event("incoming_call", caller=caller, business=client["business_name"])
 
     # Explicit opt-in: caller must press 1 before we'll text them later if
     # the call goes unanswered. This is required for A2P 10DLC compliance —
@@ -560,7 +681,7 @@ def voice():
         method="POST",
         action_on_empty_result=True,
     )
-    gather.say(OPT_IN_PROMPT)
+    gather.say(build_opt_in_prompt(client))
     vr.append(gather)
     # Safety net in case Gather's action callback itself never fires.
     vr.redirect(f"{PUBLIC_BASE_URL}/voice/opt-in")
@@ -571,19 +692,21 @@ def voice():
 @validate_twilio_request
 def voice_opt_in():
     caller = request.form.get("From", "unknown")
+    to_number = request.form.get("To", "")
+    client = resolve_client(to_number)
     digits = request.form.get("Digits", "")
     consented = digits.strip() == "1"
     set_consent(caller, consented)
     log_event("sms_opt_in", caller=caller, consented=consented, digits_received=digits)
 
     vr = VoiceResponse()
-    if FORWARD_TO:
+    if client["forward_to"]:
         dial = Dial(
-            timeout=RING_TIMEOUT_SECONDS,
+            timeout=client["ring_timeout_seconds"],
             action=f"{PUBLIC_BASE_URL}/voice/status",
             method="POST",
         )
-        dial.number(FORWARD_TO)
+        dial.number(client["forward_to"])
         vr.append(dial)
     else:
         # No forwarding number configured — go straight to voicemail-style message.
@@ -600,21 +723,23 @@ def voice_opt_in():
 @validate_twilio_request
 def voice_status():
     caller = request.form.get("From", "unknown")
+    to_number = request.values.get("To", "")
+    client = resolve_client(to_number)
     # DialCallStatus normally arrives as a POST form field (Twilio's own
     # <Dial action=...> callback does this). But the no-FORWARD_TO fallback
     # above redirects here with it as a URL query param instead, which
     # request.form can't see — use request.values so both paths work.
     call_status = request.values.get("DialCallStatus", "unknown")
-    log_event("call_status", caller=caller, status=call_status)
+    log_event("call_status", caller=caller, status=call_status, business=client["business_name"])
 
     vr = VoiceResponse()
     if call_status in ("no-answer", "busy", "failed", "canceled"):
         if has_consent(caller):
             body = (
-                f"Hey! Sorry we missed your call at {BUSINESS_NAME}. "
+                f"Hey! Sorry we missed your call at {client['business_name']}. "
                 f"What can we help with? (Reply here and we'll get right back to you.)"
             )
-            send_sms(caller, body)
+            send_sms(caller, body, client["twilio_number"])
             log_event("missed_call_text_sent", caller=caller)
         else:
             log_event("missed_call_no_consent_skipped", caller=caller)
@@ -629,15 +754,119 @@ def voice_status():
 @validate_twilio_request
 def sms():
     caller = request.form.get("From", "unknown")
+    to_number = request.form.get("To", "")
+    client = resolve_client(to_number)
     body = request.form.get("Body", "")
-    log_event("incoming_sms", caller=caller, body=body)
+    log_event("incoming_sms", caller=caller, body=body, business=client["business_name"])
 
-    reply_text = ai_reply(caller, body)
+    reply_text = ai_reply(caller, body, client)
     log_event("ai_reply_sent", caller=caller, reply=reply_text)
 
     resp = MessagingResponse()
     resp.message(reply_text)
     return Response(str(resp), mimetype="text/xml")
+
+
+# ---------------------------------------------------------------------
+# Admin: onboard/update/remove a client without touching code or env vars.
+# Protected by a shared secret (ADMIN_SECRET) passed as ?secret=... — not
+# enterprise auth, but enough that the URL isn't guessable, which is the
+# right bar for a solo-operator admin page.
+# ---------------------------------------------------------------------
+def _check_admin_secret():
+    secret = request.args.get("secret") or request.form.get("secret") or request.headers.get("X-Admin-Secret", "")
+    if not ADMIN_SECRET or secret != ADMIN_SECRET:
+        abort(403)
+
+
+@app.route("/admin/clients", methods=["GET", "POST"])
+def admin_clients():
+    _check_admin_secret()
+    secret = request.args.get("secret") or request.form.get("secret")
+    message = ""
+
+    if request.method == "POST":
+        action = request.form.get("action", "save")
+        twilio_number = request.form.get("twilio_number", "").strip()
+
+        if action == "delete":
+            if twilio_number:
+                delete_client(twilio_number)
+                message = f"Removed {twilio_number}."
+        else:
+            business_name = request.form.get("business_name", "").strip()
+            business_trade = request.form.get("business_trade", "").strip()
+            forward_to = request.form.get("forward_to", "").strip()
+            emergency_phone = request.form.get("emergency_phone", "").strip() or None
+            ring_timeout_raw = request.form.get("ring_timeout_seconds", "").strip()
+            ring_timeout_seconds = int(ring_timeout_raw) if ring_timeout_raw.isdigit() else None
+
+            if not (twilio_number and business_name and business_trade and forward_to):
+                message = "Twilio number, business name, trade, and forward-to number are all required."
+            else:
+                upsert_client(
+                    twilio_number, business_name, business_trade, forward_to,
+                    emergency_phone, ring_timeout_seconds,
+                )
+                message = f"Saved {business_name} ({twilio_number}). Point that number's " \
+                          f"Twilio webhooks at this app and it's live — no deploy needed."
+
+    clients = list_clients()
+    if clients:
+        rows_html = "".join(
+            f"""<tr>
+                <td>{c['business_name']}</td><td>{c['twilio_number']}</td>
+                <td>{c['business_trade']}</td><td>{c['forward_to']}</td>
+                <td>{c['emergency_phone'] or '—'}</td>
+                <td><form method="POST" style="display:inline" onsubmit="return confirm('Remove {c['business_name']}?')">
+                    <input type="hidden" name="secret" value="{secret}">
+                    <input type="hidden" name="action" value="delete">
+                    <input type="hidden" name="twilio_number" value="{c['twilio_number']}">
+                    <button type="submit">Remove</button></form></td>
+            </tr>"""
+            for c in clients
+        )
+    else:
+        rows_html = (
+            f"<tr><td colspan='6'>No per-client rows yet — "
+            f"{DEFAULT_CLIENT['business_name']} ({DEFAULT_CLIENT['twilio_number'] or 'TWILIO_NUMBER not set'}) "
+            f"is running on the built-in default config from env vars.</td></tr>"
+        )
+
+    return f"""<html><head><title>Clients — admin</title>
+<style>
+body{{font-family:-apple-system,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}}
+table{{width:100%;border-collapse:collapse;margin-bottom:2rem;font-size:.85rem}}
+td,th{{border:1px solid #ddd;padding:.5rem .6rem;text-align:left}}
+th{{background:#f5f5f5}}
+label{{display:block;margin-top:.8rem;font-weight:600;font-size:.9rem}}
+input{{width:100%;padding:.5rem;box-sizing:border-box;margin-top:.2rem}}
+button{{margin-top:1rem;padding:.6rem 1.2rem;cursor:pointer}}
+.msg{{background:#e6f4ea;padding:.6rem .8rem;border-radius:4px;margin-bottom:1rem}}
+</style></head><body>
+<h1>Clients</h1>
+{'<p class="msg">' + message + '</p>' if message else ''}
+<table><tr><th>Business</th><th>Twilio #</th><th>Trade</th><th>Forward to</th><th>Emergency #</th><th></th></tr>
+{rows_html}
+</table>
+<h2>Add / update a client</h2>
+<form method="POST">
+<input type="hidden" name="secret" value="{secret}">
+<label>Twilio number (E.164, e.g. +17065551234) — the number this client's customers call/text</label>
+<input name="twilio_number" required>
+<label>Business name</label>
+<input name="business_name" required>
+<label>Trade (e.g. "plumbing and drain cleaning")</label>
+<input name="business_trade" required>
+<label>Forward-to number (the owner's real phone, E.164)</label>
+<input name="forward_to" required>
+<label>Emergency phone (optional — defaults to the Twilio number above)</label>
+<input name="emergency_phone">
+<label>Ring timeout, seconds (optional — defaults to {RING_TIMEOUT_SECONDS})</label>
+<input name="ring_timeout_seconds">
+<button type="submit">Save client</button>
+</form>
+</body></html>"""
 
 
 @app.route("/", methods=["GET"])

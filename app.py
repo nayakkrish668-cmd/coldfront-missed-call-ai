@@ -189,6 +189,14 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_webhooks (
+                request_key TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -271,6 +279,23 @@ def mark_owner_notified(phone: str):
             (phone, datetime.datetime.utcnow().isoformat()),
         )
         conn.commit()
+
+
+def claim_request_once(request_key: str) -> bool:
+    """True the first time this key is seen, False on a retry. Twilio
+    resends a webhook POST if it doesn't get a timely response (network
+    blip, cold-start delay on the free tier, etc.) — without this, a retry
+    would re-run everything, including sending the SAME missed-call text or
+    AI reply a second time. Callers build request_key from a Twilio-
+    provided SID (CallSid, MessageSid), which Twilio keeps identical across
+    retries of the same event but never reuses for a different one."""
+    with closing(get_db()) as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO processed_webhooks (request_key, created_at) VALUES (?, ?)",
+            (request_key, datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------
@@ -846,6 +871,7 @@ def voice_opt_in():
 @validate_twilio_request
 def voice_status():
     caller = request.form.get("From", "unknown")
+    call_sid = request.values.get("CallSid", "")
     to_number = request.values.get("To", "")
     client = resolve_client(to_number)
     # DialCallStatus normally arrives as a POST form field (Twilio's own
@@ -857,7 +883,12 @@ def voice_status():
 
     vr = VoiceResponse()
     if call_status in ("no-answer", "busy", "failed", "canceled"):
-        if has_consent(caller):
+        # Twilio retries this webhook if it doesn't get a timely response
+        # (cold-start delay on the free tier is a real way to trigger that).
+        # Without this check, a retry would text the caller a second time.
+        if call_sid and not claim_request_once(f"voice_status:{call_sid}"):
+            log_event("voice_status_duplicate_retry_skipped", caller=caller, call_sid=call_sid)
+        elif has_consent(caller):
             body = (
                 f"Hey! Sorry we missed your call at {client['business_name']}. "
                 f"What can we help with? (Reply here and we'll get right back to you.)"
@@ -885,7 +916,16 @@ def sms():
     to_number = request.form.get("To", "")
     client = resolve_client(to_number)
     body = request.form.get("Body", "")
+    message_sid = request.form.get("MessageSid", "")
     log_event("incoming_sms", caller=caller, body=body, business=client["business_name"])
+
+    # Twilio retries this webhook if it doesn't get a timely response. A
+    # retry carries the same MessageSid as the original, so this makes a
+    # retry a no-op instead of calling the AI again and sending a second
+    # reply (or a second STOP/HELP confirmation) for one inbound text.
+    if message_sid and not claim_request_once(f"sms:{message_sid}"):
+        log_event("sms_duplicate_retry_skipped", caller=caller, message_sid=message_sid)
+        return Response(str(MessagingResponse()), mimetype="text/xml")
 
     # SMS opt-out/help keywords (TCPA / A2P 10DLC compliance). Twilio-level
     # Advanced Opt-Out may already intercept some of these before they ever

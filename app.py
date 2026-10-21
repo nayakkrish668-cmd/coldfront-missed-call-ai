@@ -39,6 +39,7 @@ from twilio.twiml.voice_response import VoiceResponse, Dial, Gather
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client
+from twilio.base.exceptions import TwilioException
 from anthropic import Anthropic, APIError
 
 app = Flask(__name__)
@@ -122,6 +123,14 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lead_notifications (
+                phone TEXT PRIMARY KEY,
+                notified_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -157,6 +166,23 @@ def append_message(phone: str, role: str, content: str):
         conn.execute(
             "INSERT INTO messages (phone, role, content, created_at) VALUES (?, ?, ?, ?)",
             (phone, role, content, datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def already_notified_owner(phone: str) -> bool:
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM lead_notifications WHERE phone = ?", (phone,)
+        ).fetchone()
+        return row is not None
+
+
+def mark_owner_notified(phone: str):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO lead_notifications (phone, notified_at) VALUES (?, ?)",
+            (phone, datetime.datetime.utcnow().isoformat()),
         )
         conn.commit()
 
@@ -203,13 +229,47 @@ after a call wasn't answered. Your job:
 - Answer simple questions (you don't know exact pricing — say a technician will \
 confirm pricing on the visit)
 - Try to get: their name, a short description of the issue, and a preferred day/time
-- Once you have those, confirm you're passing it to the team to schedule, and say \
-someone will follow up shortly to finalize the appointment
+- Once you have those three things, call the capture_lead tool so the business \
+owner is notified right away — do this in the SAME turn as your reply to the \
+customer, not instead of it. Call it only once per conversation, and only once \
+you actually have real values (never call it with guessed or placeholder info).
+- Still send the customer a short reply in every turn, confirming you're passing \
+it to the team to schedule and that someone will follow up shortly
 - Keep every reply SHORT (1-3 sentences) — this is a text conversation, not an email
 - If it sounds like a true emergency (gas leak, no heat in freezing weather, water \
 flooding), tell them to call {_format_phone_for_display(EMERGENCY_PHONE)} directly \
 right now instead of texting
 Never make up a price, availability, or promise a specific technician."""
+
+CAPTURE_LEAD_TOOL = {
+    "name": "capture_lead",
+    "description": (
+        "Call this once — and only once — you have the customer's name, a "
+        "description of what they need, and a preferred day/time for the visit. "
+        "This immediately notifies the business owner with the lead details. "
+        "Don't call it with guessed, placeholder, or incomplete values."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "customer_name": {"type": "string", "description": "The customer's name"},
+            "issue_description": {
+                "type": "string",
+                "description": "Short description of what the customer needs",
+            },
+            "preferred_time": {
+                "type": "string",
+                "description": "The day/time the customer said works for them",
+            },
+            "urgency": {
+                "type": "string",
+                "enum": ["normal", "emergency"],
+                "description": "'emergency' only if the customer described a true emergency",
+            },
+        },
+        "required": ["customer_name", "issue_description", "preferred_time", "urgency"],
+    },
+}
 
 
 def log_event(kind: str, **fields):
@@ -223,6 +283,37 @@ def send_sms(to: str, body: str):
     twilio_client.messages.create(to=to, from_=TWILIO_NUMBER, body=body)
 
 
+def notify_owner_of_lead(caller: str, lead: dict):
+    """Text FORWARD_TO a summary of a captured lead, at most once per phone
+    number. This is the thing that actually gets a real business owner's
+    attention — without it, a captured lead just sits in a SQLite table
+    nobody is looking at."""
+    if already_notified_owner(caller):
+        return
+    if not FORWARD_TO:
+        log_event("lead_captured_no_forward_to", caller=caller, lead=lead)
+        mark_owner_notified(caller)
+        return
+
+    urgency = lead.get("urgency", "normal")
+    tag = "🚨 EMERGENCY LEAD" if urgency == "emergency" else "🔔 New lead"
+    body = (
+        f"{tag} via AI text-back\n"
+        f"From: {_format_phone_for_display(caller)}\n"
+        f"Name: {lead.get('customer_name', '—')}\n"
+        f"Needs: {lead.get('issue_description', '—')}\n"
+        f"Preferred time: {lead.get('preferred_time', '—')}"
+    )
+    try:
+        send_sms(FORWARD_TO, body)
+        log_event("owner_notified", caller=caller, lead=lead)
+    except TwilioException as exc:
+        # Never let a failed owner-notification crash the customer's reply —
+        # the customer still needs their text even if this alert fails.
+        log_event("owner_notify_failed", caller=caller, error=str(exc))
+    mark_owner_notified(caller)
+
+
 def ai_reply(caller: str, incoming_text: str) -> str:
     append_message(caller, "user", incoming_text)
     history = get_history(caller)
@@ -231,11 +322,20 @@ def ai_reply(caller: str, incoming_text: str) -> str:
         try:
             resp = ai_client.messages.create(
                 model="claude-sonnet-4-5",
-                max_tokens=200,
+                max_tokens=300,
                 system=SYSTEM_PROMPT,
+                tools=[CAPTURE_LEAD_TOOL],
                 messages=history,
             )
-            reply_text = resp.content[0].text
+            reply_text = ""
+            for block in resp.content:
+                if block.type == "text":
+                    reply_text += block.text
+                elif block.type == "tool_use" and block.name == "capture_lead":
+                    notify_owner_of_lead(caller, block.input)
+            reply_text = reply_text.strip() or (
+                "Thanks — I've got what I need and I'm passing it to the team now!"
+            )
         except APIError as exc:
             # Anthropic being down, rate-limited, or out of credits must
             # never surface as a raw 500 — that's what gets a real customer

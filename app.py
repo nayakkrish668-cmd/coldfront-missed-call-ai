@@ -58,6 +58,13 @@ BUSINESS_NAME = os.environ.get("BUSINESS_NAME", "ABC Home Services")
 BUSINESS_TRADE = os.environ.get("BUSINESS_TRADE", "HVAC repair and installation")
 RING_TIMEOUT_SECONDS = int(os.environ.get("RING_TIMEOUT_SECONDS", "18"))
 
+# How long a captured-lead notification to the owner "counts" before the
+# same phone number can trigger another one. This stops one conversation's
+# back-and-forth from texting the owner repeatedly, WITHOUT permanently
+# silencing that customer — after this window a new issue from them still
+# gets through. 24h comfortably covers a single conversation thread.
+LEAD_DEDUPE_HOURS = int(os.environ.get("LEAD_DEDUPE_HOURS", "24"))
+
 # Number the AI tells a texting customer to call for a true emergency.
 # Defaults to the business's own Twilio number (which already forwards to
 # FORWARD_TO) so there's never a placeholder like ###-###-#### in a live
@@ -239,9 +246,19 @@ def append_message(phone: str, role: str, content: str):
 
 
 def already_notified_owner(phone: str) -> bool:
+    """True only if this phone was notified within the dedupe window. This is
+    deliberately a ROLLING window, not a permanent flag — the point is to
+    stop one back-and-forth conversation from texting the owner more than
+    once, not to silently drop every future lead from a repeat customer.
+    Without the window, a customer who called back in the future about a
+    brand-new issue would just never generate an owner text again."""
     with closing(get_db()) as conn:
+        cutoff = (
+            datetime.datetime.utcnow() - datetime.timedelta(hours=LEAD_DEDUPE_HOURS)
+        ).isoformat()
         row = conn.execute(
-            "SELECT 1 FROM lead_notifications WHERE phone = ?", (phone,)
+            "SELECT 1 FROM lead_notifications WHERE phone = ? AND notified_at > ?",
+            (phone, cutoff),
         ).fetchone()
         return row is not None
 
@@ -249,7 +266,8 @@ def already_notified_owner(phone: str) -> bool:
 def mark_owner_notified(phone: str):
     with closing(get_db()) as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO lead_notifications (phone, notified_at) VALUES (?, ?)",
+            "INSERT INTO lead_notifications (phone, notified_at) VALUES (?, ?) "
+            "ON CONFLICT(phone) DO UPDATE SET notified_at=excluded.notified_at",
             (phone, datetime.datetime.utcnow().isoformat()),
         )
         conn.commit()
@@ -855,6 +873,11 @@ def voice_status():
 # ---------------------------------------------------------------------
 # SMS: incoming text -> AI reply -> text back
 # ---------------------------------------------------------------------
+STOP_KEYWORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}
+START_KEYWORDS = {"START", "YES", "UNSTOP"}
+HELP_KEYWORDS = {"HELP", "INFO"}
+
+
 @app.route("/sms", methods=["POST"])
 @validate_twilio_request
 def sms():
@@ -864,10 +887,45 @@ def sms():
     body = request.form.get("Body", "")
     log_event("incoming_sms", caller=caller, body=body, business=client["business_name"])
 
+    # SMS opt-out/help keywords (TCPA / A2P 10DLC compliance). Twilio-level
+    # Advanced Opt-Out may already intercept some of these before they ever
+    # reach this webhook, but handling them here too keeps OUR OWN consent
+    # record (sms_consent — what the missed-call text-back checks) in sync
+    # regardless, and means HELP/START always work even if that Twilio
+    # feature isn't enabled on this number. These short-circuit before the
+    # AI entirely — no LLM call, no lead capture, just the required reply.
+    normalized = body.strip().upper()
+    resp = MessagingResponse()
+
+    if normalized in STOP_KEYWORDS:
+        set_consent(caller, False)
+        log_event("sms_opt_out", caller=caller, business=client["business_name"])
+        resp.message(
+            f"You've been unsubscribed from {client['business_name']} text messages "
+            "and won't receive any more. Reply START to resubscribe."
+        )
+        return Response(str(resp), mimetype="text/xml")
+
+    if normalized in START_KEYWORDS:
+        set_consent(caller, True)
+        log_event("sms_opt_in_via_text", caller=caller, business=client["business_name"])
+        resp.message(
+            f"You're resubscribed to {client['business_name']} text messages. "
+            "Reply STOP at any time to opt out."
+        )
+        return Response(str(resp), mimetype="text/xml")
+
+    if normalized in HELP_KEYWORDS:
+        resp.message(
+            f"{client['business_name']}: text us here for help with your service "
+            f"request, or call {_format_phone_for_display(client['twilio_number'])}. "
+            "Reply STOP to opt out. Msg & data rates may apply."
+        )
+        return Response(str(resp), mimetype="text/xml")
+
     reply_text = ai_reply(caller, body, client)
     log_event("ai_reply_sent", caller=caller, reply=reply_text)
 
-    resp = MessagingResponse()
     resp.message(reply_text)
     return Response(str(resp), mimetype="text/xml")
 

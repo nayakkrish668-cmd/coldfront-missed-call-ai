@@ -588,7 +588,7 @@ def ai_reply(caller: str, incoming_text: str, client: dict) -> str:
     if ai_client:
         try:
             resp = ai_client.messages.create(
-                model="claude-sonnet-4-5",
+                model="claude-sonnet-5",
                 max_tokens=300,
                 system=build_system_prompt(client),
                 tools=[CAPTURE_LEAD_TOOL],
@@ -700,7 +700,7 @@ def _demo_ai_reply(call_sid: str, mode: str, caller_said: str) -> str:
     if ai_client:
         try:
             resp = ai_client.messages.create(
-                model="claude-sonnet-4-5",
+                model="claude-sonnet-5",
                 max_tokens=120,
                 system=DEMO_SYSTEM_PROMPTS[mode],
                 messages=history,

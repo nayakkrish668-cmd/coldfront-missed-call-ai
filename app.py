@@ -29,6 +29,7 @@ is capped at a few turns so a stray demo call can't run up an API bill.
 """
 
 import os
+import secrets
 import sqlite3
 import datetime
 import logging
@@ -62,9 +63,11 @@ RING_TIMEOUT_SECONDS = int(os.environ.get("RING_TIMEOUT_SECONDS", "18"))
 # reply; override with EMERGENCY_PHONE if it should ring somewhere else.
 EMERGENCY_PHONE = os.environ.get("EMERGENCY_PHONE", "") or TWILIO_NUMBER
 
-# Shared secret for the /admin/clients onboarding page below. Set this on
-# Render (same as the other env vars) — the page is unreachable without it.
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
+# Login for the /admin/clients onboarding page below (HTTP Basic Auth —
+# your browser will prompt for these, nothing to paste into a URL). Set
+# both on Render. If ADMIN_PASSWORD is unset, the page refuses all access.
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 # These env vars describe ONE business — kept as the fallback "default
 # client" so the very first deployment needs zero database rows. Onboarding
@@ -769,20 +772,36 @@ def sms():
 
 # ---------------------------------------------------------------------
 # Admin: onboard/update/remove a client without touching code or env vars.
-# Protected by a shared secret (ADMIN_SECRET) passed as ?secret=... — not
-# enterprise auth, but enough that the URL isn't guessable, which is the
-# right bar for a solo-operator admin page.
+# Protected by HTTP Basic Auth (ADMIN_USERNAME / ADMIN_PASSWORD) rather than
+# a secret baked into the URL — a URL-embedded secret ends up in browser
+# history, can get logged by intermediate services, and is easy to leak by
+# pasting the link somewhere. Basic Auth keeps the credential in a login
+# prompt instead, and constant-time comparison avoids leaking the password
+# one byte at a time via response-timing differences.
 # ---------------------------------------------------------------------
-def _check_admin_secret():
-    secret = request.args.get("secret") or request.form.get("secret") or request.headers.get("X-Admin-Secret", "")
-    if not ADMIN_SECRET or secret != ADMIN_SECRET:
-        abort(403)
+def require_admin_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        ok = bool(
+            ADMIN_PASSWORD
+            and auth
+            and secrets.compare_digest(auth.username or "", ADMIN_USERNAME)
+            and secrets.compare_digest(auth.password or "", ADMIN_PASSWORD)
+        )
+        if not ok:
+            return Response(
+                "Login required.", 401,
+                {"WWW-Authenticate": 'Basic realm="ColdFront admin"'},
+            )
+        return f(*args, **kwargs)
+
+    return decorated
 
 
 @app.route("/admin/clients", methods=["GET", "POST"])
+@require_admin_auth
 def admin_clients():
-    _check_admin_secret()
-    secret = request.args.get("secret") or request.form.get("secret")
     message = ""
 
     if request.method == "POST":
@@ -819,7 +838,6 @@ def admin_clients():
                 <td>{c['business_trade']}</td><td>{c['forward_to']}</td>
                 <td>{c['emergency_phone'] or '—'}</td>
                 <td><form method="POST" style="display:inline" onsubmit="return confirm('Remove {c['business_name']}?')">
-                    <input type="hidden" name="secret" value="{secret}">
                     <input type="hidden" name="action" value="delete">
                     <input type="hidden" name="twilio_number" value="{c['twilio_number']}">
                     <button type="submit">Remove</button></form></td>
@@ -851,7 +869,6 @@ button{{margin-top:1rem;padding:.6rem 1.2rem;cursor:pointer}}
 </table>
 <h2>Add / update a client</h2>
 <form method="POST">
-<input type="hidden" name="secret" value="{secret}">
 <label>Twilio number (E.164, e.g. +17065551234) — the number this client's customers call/text</label>
 <input name="twilio_number" required>
 <label>Business name</label>

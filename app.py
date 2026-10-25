@@ -986,13 +986,13 @@ def kickoff_sales_outreach(phone: str, business: str, trade: str, preferred_desi
 # Onboarding AI — fires the instant someone actually pays (Stripe webhook,
 # below). Collects the two things we don't already have from checkout
 # (their trade, and the real phone number their calls should forward to)
-# and, once it has both, alerts Krish with a ready-to-paste client record.
-# He still adds the real Twilio number + forwarding by hand for now via
-# /admin/clients — buying a client their own number is instant, but it
-# can't actually SEND texts until its A2P 10DLC carrier registration
-# clears (same thing the pricing page already tells customers), so fully
-# automating that step wouldn't make it instant anyway; it just adds a
-# second async process to track. Worth revisiting once volume justifies it.
+# and, once it has both, auto-buys them a real Twilio number and wires up
+# call forwarding immediately (see provision_client_number/complete_onboarding)
+# — no waiting on Krish. The one thing that genuinely can't be made instant
+# is text-back itself: a brand-new number can't SEND texts until its A2P
+# 10DLC carrier registration clears (same thing the pricing page already
+# tells customers), which is a telecom compliance review outside anyone's
+# control — call forwarding works immediately regardless.
 # ---------------------------------------------------------------------
 ONBOARDING_CAPTURE_TOOL = {
     "name": "capture_onboarding_info",
@@ -1029,7 +1029,7 @@ YOUR ONLY JOB: collect two things, naturally, in a short friendly welcome —
 from, or a different business line — ask, don't assume)
 
 As soon as you have BOTH, call capture_onboarding_info in the SAME turn as your reply, not instead of it. \
-Then let them know Krish will have everything live shortly.
+Then let them know their number is being set up right now and a confirmation text is coming in a moment.
 
 Don't re-pitch them, don't discuss pricing (they already paid), and don't promise a specific setup time \
 beyond "shortly." If they ask something you don't know, say Krish will cover it when he finishes their setup.
@@ -1061,10 +1061,10 @@ def notify_owner_of_new_customer(business: str, tier: str, email: str, phone: st
 
 
 def notify_owner_ready_to_add_client(phone: str, thread: dict, info: dict):
-    """Fires once onboarding has both pieces of info — this is the
-    "paste this into /admin/clients" moment."""
+    """Fallback for when auto-provisioning (below) couldn't buy a number —
+    this is the "add them by hand in /admin/clients" moment."""
     body = (
-        "✅ Ready to add as a client\n"
+        "✅ Ready to add as a client (number auto-buy failed, needs you)\n"
         f"Business: {thread.get('business') or '—'}\n"
         f"Trade: {info.get('trade', '—')}\n"
         f"Forward to: {info.get('forward_to', '—')}\n"
@@ -1077,6 +1077,93 @@ def notify_owner_ready_to_add_client(phone: str, thread: dict, info: dict):
         log_event("onboarding_complete_notified", phone=phone, info=info)
     except TwilioException as exc:
         log_event("onboarding_complete_notify_failed", phone=phone, error=str(exc))
+
+
+def _area_code(e164_phone: str) -> str | None:
+    digits = re.sub(r"\D", "", e164_phone or "")
+    if len(digits) == 11 and digits.startswith("1"):
+        return digits[1:4]
+    if len(digits) == 10:
+        return digits[:3]
+    return None
+
+
+def provision_client_number(business: str, trade: str, forward_to: str) -> str | None:
+    """Buy a new Twilio number for this client and immediately wire it into
+    the clients table with voice/sms webhooks pointed at this same app, so
+    call forwarding works within seconds — no waiting on Krish to notice a
+    text and do it by hand. Prefers the forward-to number's own area code
+    for a more local-feeling number, falling back to any available one.
+    Never raises: a provisioning hiccup (no numbers available, Twilio
+    account restriction, etc.) should alert Krish, not crash the webhook
+    that's also trying to confirm payment to the customer."""
+    if not twilio_client or not PUBLIC_BASE_URL:
+        return None
+    try:
+        area_code = _area_code(forward_to)
+        candidates = []
+        if area_code:
+            candidates = twilio_client.available_phone_numbers("US").local.list(
+                area_code=area_code, limit=1, sms_enabled=True, voice_enabled=True
+            )
+        if not candidates:
+            candidates = twilio_client.available_phone_numbers("US").local.list(
+                limit=1, sms_enabled=True, voice_enabled=True
+            )
+        if not candidates:
+            return None
+        bought = twilio_client.incoming_phone_numbers.create(
+            phone_number=candidates[0].phone_number,
+            voice_url=f"{PUBLIC_BASE_URL}/voice",
+            voice_method="POST",
+            sms_url=f"{PUBLIC_BASE_URL}/sms",
+            sms_method="POST",
+        )
+        upsert_client(bought.phone_number, business or "New Client", trade or "home services", forward_to)
+        log_event("number_provisioned", business=business, twilio_number=bought.phone_number)
+        return bought.phone_number
+    except TwilioException as exc:
+        log_event("number_provisioning_failed", business=business, error=str(exc))
+        return None
+
+
+def complete_onboarding(phone: str, thread: dict, info: dict):
+    """Dispatched from capture_onboarding_info. Tries to auto-provision a
+    real client number first; only falls back to "do it by hand" if that
+    genuinely can't be done right now (no numbers available, Twilio
+    hiccup, etc.) — the customer should never wait on Krish noticing a
+    text if the whole thing can just happen automatically."""
+    business = thread.get("business") or ""
+    trade = info.get("trade", "")
+    forward_to_raw = info.get("forward_to", "")
+    forward_to = _normalize_us_phone(forward_to_raw) or forward_to_raw
+
+    new_number = provision_client_number(business, trade, forward_to)
+    if new_number:
+        display_number = _format_phone_for_display(new_number)
+        try:
+            send_sms(
+                FORWARD_TO,
+                f"✅ Auto-provisioned {display_number} for {business or '—'} ({trade}), "
+                f"forwarding to {_format_phone_for_display(forward_to)}. Call forwarding is live now. "
+                "Text-back activates once carrier (A2P) registration clears — usually within a day or two.",
+                TWILIO_NUMBER,
+            )
+        except TwilioException as exc:
+            log_event("auto_provision_owner_notify_failed", phone=phone, error=str(exc))
+        try:
+            send_sms(
+                phone,
+                f"You're all set! Your number is {display_number} — save it, this is what customers will "
+                "see and call. Call forwarding is live right now. Text-back (texting anyone you miss) "
+                "switches on automatically once carrier registration clears, usually within a day or two.",
+                TWILIO_NUMBER,
+            )
+            append_message(phone, "assistant", "[auto-provisioning confirmation sent]")
+        except TwilioException as exc:
+            log_event("auto_provision_customer_notify_failed", phone=phone, error=str(exc))
+    else:
+        notify_owner_ready_to_add_client(phone, thread, info)
 
 
 def ai_onboarding_reply(phone: str, incoming_text: str, thread: dict) -> str:
@@ -1097,7 +1184,7 @@ def ai_onboarding_reply(phone: str, incoming_text: str, thread: dict) -> str:
                 if block.type == "text":
                     reply_text += block.text
                 elif block.type == "tool_use" and block.name == "capture_onboarding_info":
-                    notify_owner_ready_to_add_client(phone, thread, block.input)
+                    complete_onboarding(phone, thread, block.input)
             reply_text = reply_text.strip() or "Got it, thanks!"
         except APIError as exc:
             log_event("onboarding_ai_reply_failed", phone=phone, error=str(exc))

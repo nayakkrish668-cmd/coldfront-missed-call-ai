@@ -29,6 +29,7 @@ is capped at a few turns so a stray demo call can't run up an API bill.
 """
 
 import os
+import re
 import time
 import sqlite3
 import datetime
@@ -168,6 +169,18 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS sales_threads (
+                phone TEXT PRIMARY KEY,
+                business TEXT,
+                trade TEXT,
+                preferred_design TEXT,
+                page TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS clients (
                 twilio_number TEXT PRIMARY KEY,
                 business_name TEXT NOT NULL,
@@ -296,6 +309,48 @@ def claim_request_once(request_key: str) -> bool:
         )
         conn.commit()
         return cur.rowcount > 0
+
+
+def _normalize_us_phone(raw: str) -> str | None:
+    """Turn whatever a lead typed into a request-form phone field (spaces,
+    dashes, parens, a stray +1) into E.164, or None if it doesn't look like
+    a real 10/11-digit US number. Twilio's API rejects a malformed `to`
+    outright, so this is the difference between a lead quietly not getting
+    texted and a 500 on an endpoint a real visitor's browser just called."""
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return None
+
+
+# ---------------------------------------------------------------------
+# ColdFront Studio's OWN sales outreach — separate from the per-client
+# missed-call text-back product above. When a prospect submits the "free
+# mockup" request form on the marketing site, we don't just alert Krish —
+# we also have the AI itself text the LEAD back immediately, as a skilled
+# sales assistant, using the exact same number/infra as the demo. A phone
+# in this table means "the next inbound text from this number continues a
+# ColdFront Studio sales conversation", so /sms routes it here instead of
+# treating it as a customer of whatever demo business owns TWILIO_NUMBER.
+# ---------------------------------------------------------------------
+def mark_sales_thread(phone: str, business: str, trade: str, preferred_design: str, page: str):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO sales_threads (phone, business, trade, preferred_design, page, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(phone) DO UPDATE SET business=excluded.business, trade=excluded.trade, "
+            "preferred_design=excluded.preferred_design, page=excluded.page",
+            (phone, business, trade, preferred_design, page, datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def get_sales_thread(phone: str) -> dict | None:
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT * FROM sales_threads WHERE phone = ?", (phone,)).fetchone()
+        return dict(row) if row else None
 
 
 # ---------------------------------------------------------------------
@@ -627,6 +682,163 @@ def ai_reply(caller: str, incoming_text: str, client: dict) -> str:
 
 
 # ---------------------------------------------------------------------
+# ColdFront Studio's own AI sales assistant. Fires the moment someone
+# submits the "free mockup" request form on the marketing site — texts
+# the LEAD (not just Krish) immediately, as a skilled, honest, clearly-
+# disclosed-as-AI sales rep, instead of waiting for a human to notice the
+# alert and respond. Krish still gets the alert (see /notify-request)
+# so he can jump in personally any time; this just means the lead never
+# has to wait on that to hear back.
+# ---------------------------------------------------------------------
+SALES_CAPTURE_TOOL = {
+    "name": "capture_callback",
+    "description": (
+        "Call this once the lead has agreed to a callback/demo call, given a "
+        "day or time that works, or clearly asked to just talk to a real "
+        "person now. This immediately alerts Krish so he can follow up. "
+        "Don't call it with guessed values, and don't call it more than once "
+        "per conversation unless the agreed time actually changes."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "business_name": {"type": "string", "description": "The lead's business name"},
+            "preferred_time": {
+                "type": "string",
+                "description": "Day/time they said works, or 'ASAP' if they just want a call now",
+            },
+            "notes": {
+                "type": "string",
+                "description": "Anything else useful Krish should know before calling (questions asked, objections, which tier they liked)",
+            },
+        },
+        "required": ["business_name", "preferred_time"],
+    },
+}
+
+
+def build_sales_system_prompt(thread: dict) -> str:
+    business = thread.get("business") or "their business"
+    trade = thread.get("trade") or "a home-service"
+    preferred_design = thread.get("preferred_design") or "one of the designs"
+    return f"""You are the AI sales assistant for ColdFront Studio, texting a lead who just \
+submitted the "get a free mockup" request form on ColdFront's own marketing site. This lead runs \
+{business}, a {trade} business, and had already scrolled through the full pitch (including the \
+personalized demo and pricing) before requesting this, so they are warm — your job is to keep the \
+conversation moving toward a quick call with Krish (the founder), not to re-explain the whole pitch.
+
+CRITICAL — you are an AI, and you say so plainly:
+- If asked directly whether you're a real person, a bot, or an AI, always say yes, you're an AI — \
+never claim or imply you're human. This is itself part of the pitch: you ARE the exact AI missed-call \
+text-back product ColdFront sells, demonstrating itself on this very conversation. It's fine to point \
+that out once, naturally, if it fits (e.g. "and yes — this is the same AI text-back you'd be buying").
+- Never invent facts. What you actually know about the offer:
+  - Starter: $397/mo + $399 one-time setup — AI missed-call text-back, a personalized website, monthly \
+Google Business Profile posting.
+  - Growth (most popular): $697/mo + $399 setup — everything in Starter, plus automated review requests, \
+SMS appointment reminders, automated quote follow-up.
+  - Full-Service: $1,200+/mo + $399 setup — everything in Growth, plus active local SEO, full CRM \
+pipeline management, a dedicated monthly check-in call. (For this tier, say Krish will scope it with them directly.)
+  - All tiers: 7-day trial, no contract, cancel anytime. The $399 setup is charged at checkout; monthly \
+billing starts after the trial.
+  - Preferred design they picked on the site: {preferred_design}.
+- Never make up a start date, a technical capability, or promise something not listed above. If asked \
+something you don't know, say Krish will cover it on the call.
+
+YOUR GOAL, in order of preference:
+1. Get them to agree to a quick call with Krish and a rough day/time (or "ASAP")
+2. If they'd rather just start the trial now, point them at the pricing section they already saw and \
+say Krish will also follow up to help them pick the right tier
+3. If they say now's not a good time or they're not interested, thank them briefly and back off — don't \
+be pushy past a clear "no"
+
+As soon as you have a business name and a preferred time (or they ask to just be called now), call \
+capture_callback — in the SAME turn as your reply, not instead of it.
+
+STYLE:
+- Keep every reply SHORT (1-3 sentences) — this is a real text conversation, not an email
+- Be warm, confident, and a little conversational — not stiff or corporate-sounding, but still clearly \
+an assistant doing a job, not pretending to be Krish
+- Never pressure or use fake urgency/scarcity — the real differentiators (speed, no contract, free \
+website) are strong enough on their own
+- Messages wrapped in [SYSTEM: ...] are internal context notes about what just happened on the website \
+— not something the lead said out loud. Act on them naturally; never mention "a system note" to the lead."""
+
+
+def notify_owner_of_sales_interest(phone: str, info: dict, business: str):
+    """Text Krish when the sales AI gets a lead to agree to a callback time —
+    separate from notify_owner_of_lead (that one's for a client's own
+    missed-call customers, this one's for ColdFront's own prospects)."""
+    body = (
+        "🟢 Sales lead ready for a callback\n"
+        f"Business: {info.get('business_name') or business or '—'}\n"
+        f"Phone: {_format_phone_for_display(phone)}\n"
+        f"Wants: {info.get('preferred_time', '—')}\n"
+        f"Notes: {info.get('notes', '—')}"
+    )
+    try:
+        send_sms(FORWARD_TO, body, TWILIO_NUMBER)
+        log_event("sales_callback_notified", phone=phone, info=info)
+    except TwilioException as exc:
+        log_event("sales_callback_notify_failed", phone=phone, error=str(exc))
+
+
+def ai_sales_reply(phone: str, incoming_text: str, thread: dict) -> str:
+    append_message(phone, "user", incoming_text)
+    history = get_history(phone)
+
+    if ai_client:
+        try:
+            resp = ai_client.messages.create(
+                model="claude-sonnet-5",
+                max_tokens=300,
+                system=build_sales_system_prompt(thread),
+                tools=[SALES_CAPTURE_TOOL],
+                messages=history,
+            )
+            reply_text = ""
+            for block in resp.content:
+                if block.type == "text":
+                    reply_text += block.text
+                elif block.type == "tool_use" and block.name == "capture_callback":
+                    notify_owner_of_sales_interest(phone, block.input, thread.get("business"))
+            reply_text = reply_text.strip() or (
+                "Got it — I'll let Krish know and he'll reach out shortly!"
+            )
+        except APIError as exc:
+            log_event("sales_ai_reply_failed", phone=phone, error=str(exc))
+            reply_text = (
+                "Thanks for the reply! I'm having a brief technical hiccup — "
+                "Krish will follow up with you directly shortly."
+            )
+    else:
+        reply_text = (
+            "Thanks for reaching out! Krish will follow up shortly. "
+            "(AI replies aren't configured yet — set ANTHROPIC_API_KEY to enable them.)"
+        )
+
+    append_message(phone, "assistant", reply_text)
+    return reply_text
+
+
+def kickoff_sales_outreach(phone: str, business: str, trade: str, preferred_design: str, page: str) -> str:
+    """Send the AI's own opening text to a lead the moment they submit the
+    request form, instead of waiting for them to text in first. Treats the
+    form submission itself as the opening "turn" so the thread's history
+    reads naturally for every reply after this one."""
+    mark_sales_thread(phone, business, trade, preferred_design, page)
+    thread = {"business": business, "trade": trade, "preferred_design": preferred_design, "page": page}
+    context_note = (
+        f"[SYSTEM: This lead just submitted the 'free mockup' request form on the ColdFront Studio "
+        f"website — this is not something they typed to you. Business: {business or 'not given'}. "
+        f"Trade: {trade or 'not given'}. Preferred design shown on the page: {preferred_design or 'none specified'}. "
+        "Write your opening outbound text to them now — introduce yourself, reference their business, "
+        "and invite them to grab a quick call or ask anything.]"
+    )
+    return ai_sales_reply(phone, context_note, thread)
+
+
+# ---------------------------------------------------------------------
 # LIVE VOICE DEMO — a prospect calls in and talks to the AI out loud,
 # in real time. Separate from the real product's SQLite-backed history;
 # kept in a plain in-memory dict since a demo call never needs to survive
@@ -914,10 +1126,8 @@ HELP_KEYWORDS = {"HELP", "INFO"}
 def sms():
     caller = request.form.get("From", "unknown")
     to_number = request.form.get("To", "")
-    client = resolve_client(to_number)
     body = request.form.get("Body", "")
     message_sid = request.form.get("MessageSid", "")
-    log_event("incoming_sms", caller=caller, body=body, business=client["business_name"])
 
     # Twilio retries this webhook if it doesn't get a timely response. A
     # retry carries the same MessageSid as the original, so this makes a
@@ -926,6 +1136,33 @@ def sms():
     if message_sid and not claim_request_once(f"sms:{message_sid}"):
         log_event("sms_duplicate_retry_skipped", caller=caller, message_sid=message_sid)
         return Response(str(MessagingResponse()), mimetype="text/xml")
+
+    # A reply from a lead ColdFront's own sales AI already texted first (via
+    # /notify-request) continues THAT conversation, regardless of which demo
+    # business happens to own TWILIO_NUMBER — this must be checked before the
+    # normal per-client resolution below, or the reply would get answered in
+    # character as whatever HVAC demo business TWILIO_NUMBER defaults to.
+    sales_thread = get_sales_thread(caller)
+    if sales_thread:
+        normalized = body.strip().upper()
+        resp = MessagingResponse()
+        if normalized in STOP_KEYWORDS:
+            set_consent(caller, False)
+            log_event("sales_sms_opt_out", caller=caller)
+            resp.message("You've been unsubscribed from ColdFront Studio texts. Reply START to resubscribe.")
+            return Response(str(resp), mimetype="text/xml")
+        if normalized in START_KEYWORDS:
+            set_consent(caller, True)
+            log_event("sales_sms_opt_in_via_text", caller=caller)
+            resp.message("You're resubscribed to ColdFront Studio texts. Reply STOP at any time to opt out.")
+            return Response(str(resp), mimetype="text/xml")
+        reply_text = ai_sales_reply(caller, body, sales_thread)
+        log_event("sales_ai_reply_sent", caller=caller, reply=reply_text)
+        resp.message(reply_text)
+        return Response(str(resp), mimetype="text/xml")
+
+    client = resolve_client(to_number)
+    log_event("incoming_sms", caller=caller, body=body, business=client["business_name"])
 
     # SMS opt-out/help keywords (TCPA / A2P 10DLC compliance). Twilio-level
     # Advanced Opt-Out may already intercept some of these before they ever
@@ -1198,6 +1435,22 @@ def notify_request():
                 log_event("mockup_request_notified", business=business, phone=phone)
             except TwilioException as exc:
                 log_event("mockup_request_notify_failed", business=business, error=str(exc))
+
+            # Have the AI itself text the LEAD back immediately too, as a
+            # sales assistant — rather than leaving the lead waiting on
+            # Krish to see the alert above and respond personally. Best-
+            # effort: a bad phone number or a hiccup here must never affect
+            # the owner alert that already succeeded above.
+            lead_e164 = _normalize_us_phone(phone)
+            if lead_e164:
+                try:
+                    opening_text = kickoff_sales_outreach(lead_e164, business, trade, preferred_design, page)
+                    send_sms(lead_e164, opening_text, TWILIO_NUMBER)
+                    log_event("sales_outreach_sent", business=business, phone=lead_e164)
+                except TwilioException as exc:
+                    log_event("sales_outreach_failed", business=business, phone=lead_e164, error=str(exc))
+            else:
+                log_event("sales_outreach_skipped_bad_phone", business=business, phone=phone)
         else:
             log_event("mockup_request_skipped", business=business, phone=phone)
 

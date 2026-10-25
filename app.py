@@ -1165,6 +1165,50 @@ access, and remove a row the moment someone shouldn't have it anymore instead of
 </body></html>"""
 
 
+ALLOWED_SITE_ORIGIN = "https://coldfront.studio"
+
+
+@app.route("/notify-request", methods=["POST", "OPTIONS"])
+def notify_request():
+    """Text FORWARD_TO the moment someone submits the "free mockup" request
+    form on the outreach site. Formspree only delivers to an inbox nobody is
+    watching in real time; this is the thing that actually reaches a phone.
+    Best-effort and intentionally forgiving: a bad or missing field should
+    never 500 on the visitor, it should just skip the text."""
+    if request.method == "OPTIONS":
+        resp = Response("", status=204)
+    else:
+        business = request.form.get("business", "").strip()[:120]
+        trade = request.form.get("trade", "").strip()[:60]
+        phone = request.form.get("phone", "").strip()[:30]
+        preferred_design = request.form.get("preferred_design", "").strip()[:40]
+        page = request.form.get("page", "").strip()[:200]
+
+        if business and phone and FORWARD_TO and TWILIO_NUMBER:
+            body = (
+                "🔔 New mockup request (outreach site)\n"
+                f"Business: {business}\n"
+                f"Trade: {trade or 'not given'}\n"
+                f"Phone: {phone}\n"
+                f"Preferred design: {preferred_design or 'none picked'}\n"
+                f"Page: {page or 'unknown'}"
+            )
+            try:
+                send_sms(FORWARD_TO, body, TWILIO_NUMBER)
+                log_event("mockup_request_notified", business=business, phone=phone)
+            except TwilioException as exc:
+                log_event("mockup_request_notify_failed", business=business, error=str(exc))
+        else:
+            log_event("mockup_request_skipped", business=business, phone=phone)
+
+        resp = Response("", status=204)
+
+    resp.headers["Access-Control-Allow-Origin"] = ALLOWED_SITE_ORIGIN
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+
 @app.route("/", methods=["GET"])
 def health():
     return {"status": "ok", "business": BUSINESS_NAME, "time": str(datetime.datetime.now())}

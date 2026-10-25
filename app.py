@@ -89,6 +89,16 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 # trust an unsigned POST claiming to be Stripe.
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
+# A RESTRICTED Stripe key (Subscriptions: Write only — never the full
+# secret key) used solely to push a subscription's trial_end out once a
+# client's number finishes provisioning, so every customer's trial covers
+# a full 7 days of an actually-working product, not 7 days from the
+# moment they paid regardless of how long their own setup took. Trial
+# extension is skipped (not crashed) if this isn't set.
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_LOCKOUT_SECONDS = 300  # 5 minutes
 
@@ -195,10 +205,18 @@ def init_db():
                 business TEXT,
                 tier TEXT,
                 checkout_session_id TEXT,
+                subscription_id TEXT,
                 created_at TEXT NOT NULL
             )
             """
         )
+        # subscription_id was added after this table already existed in
+        # production — ALTER TABLE so an existing deployment's data.db picks
+        # it up too; CREATE TABLE IF NOT EXISTS alone only helps a fresh one.
+        try:
+            conn.execute("ALTER TABLE onboarding_threads ADD COLUMN subscription_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # already has the column
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS demo_overrides (
@@ -389,14 +407,18 @@ def get_sales_thread(phone: str) -> dict | None:
 # thread for the same number, since the conversation's job has changed
 # from "close them" to "get them set up as a real client."
 # ---------------------------------------------------------------------
-def mark_onboarding_thread(phone: str, email: str, customer_name: str, business: str, tier: str, checkout_session_id: str):
+def mark_onboarding_thread(
+    phone: str, email: str, customer_name: str, business: str, tier: str,
+    checkout_session_id: str, subscription_id: str = "",
+):
     with closing(get_db()) as conn:
         conn.execute(
-            "INSERT INTO onboarding_threads (phone, email, customer_name, business, tier, checkout_session_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO onboarding_threads (phone, email, customer_name, business, tier, checkout_session_id, subscription_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(phone) DO UPDATE SET email=excluded.email, customer_name=excluded.customer_name, "
-            "business=excluded.business, tier=excluded.tier, checkout_session_id=excluded.checkout_session_id",
-            (phone, email, customer_name, business, tier, checkout_session_id, datetime.datetime.utcnow().isoformat()),
+            "business=excluded.business, tier=excluded.tier, checkout_session_id=excluded.checkout_session_id, "
+            "subscription_id=excluded.subscription_id",
+            (phone, email, customer_name, business, tier, checkout_session_id, subscription_id, datetime.datetime.utcnow().isoformat()),
         )
         conn.commit()
 
@@ -1127,6 +1149,29 @@ def provision_client_number(business: str, trade: str, forward_to: str) -> str |
         return None
 
 
+TRIAL_LENGTH_DAYS = 7
+
+
+def extend_trial_to_full_term(subscription_id: str, business: str):
+    """Pushes the subscription's trial_end out to exactly 7 days from RIGHT
+    NOW — the moment call forwarding actually goes live — instead of 7 days
+    from the moment they paid. Without this, a customer whose onboarding Q&A
+    or number provisioning took longer effectively gets a shorter real
+    trial than one whose setup was instant, for the exact same price. Only
+    ever pushes the date LATER, never earlier, and is a no-op (not a crash)
+    if STRIPE_SECRET_KEY isn't configured or the call fails for any reason —
+    a billing hiccup here should never block the customer's actual setup."""
+    if not STRIPE_SECRET_KEY or not subscription_id:
+        log_event("trial_extension_skipped", business=business, reason="no_key_or_sub_id")
+        return
+    try:
+        new_trial_end = int(time.time()) + TRIAL_LENGTH_DAYS * 86400
+        stripe.Subscription.modify(subscription_id, trial_end=new_trial_end)
+        log_event("trial_extended", business=business, subscription_id=subscription_id, new_trial_end=new_trial_end)
+    except stripe.error.StripeError as exc:
+        log_event("trial_extension_failed", business=business, subscription_id=subscription_id, error=str(exc))
+
+
 def complete_onboarding(phone: str, thread: dict, info: dict):
     """Dispatched from capture_onboarding_info. Tries to auto-provision a
     real client number first; only falls back to "do it by hand" if that
@@ -1141,6 +1186,7 @@ def complete_onboarding(phone: str, thread: dict, info: dict):
     new_number = provision_client_number(business, trade, forward_to)
     if new_number:
         display_number = _format_phone_for_display(new_number)
+        extend_trial_to_full_term(thread.get("subscription_id", ""), business)
         try:
             send_sms(
                 FORWARD_TO,
@@ -1156,7 +1202,9 @@ def complete_onboarding(phone: str, thread: dict, info: dict):
                 phone,
                 f"You're all set! Your number is {display_number} — save it, this is what customers will "
                 "see and call. Call forwarding is live right now. Text-back (texting anyone you miss) "
-                "switches on automatically once carrier registration clears, usually within a day or two.",
+                "switches on automatically once carrier registration clears, usually within a day or two. "
+                f"Your {TRIAL_LENGTH_DAYS}-day trial starts counting from right now, not from when you paid, "
+                "so you get the full trial on a working system.",
                 TWILIO_NUMBER,
             )
             append_message(phone, "assistant", "[auto-provisioning confirmation sent]")
@@ -1198,12 +1246,15 @@ def ai_onboarding_reply(phone: str, incoming_text: str, thread: dict) -> str:
     return reply_text
 
 
-def kickoff_onboarding(phone: str, email: str, customer_name: str, business: str, tier: str, checkout_session_id: str) -> str:
+def kickoff_onboarding(
+    phone: str, email: str, customer_name: str, business: str, tier: str,
+    checkout_session_id: str, subscription_id: str = "",
+) -> str:
     """Send the AI's own welcome/onboarding text the instant Stripe confirms
     payment — same pattern as kickoff_sales_outreach, just a different
     thread table and a different job (collect info, not close a sale)."""
-    mark_onboarding_thread(phone, email, customer_name, business, tier, checkout_session_id)
-    thread = {"business": business, "customer_name": customer_name, "tier": tier}
+    mark_onboarding_thread(phone, email, customer_name, business, tier, checkout_session_id, subscription_id)
+    thread = {"business": business, "customer_name": customer_name, "tier": tier, "subscription_id": subscription_id}
     context_note = (
         f"[SYSTEM: {customer_name or 'This customer'} just completed payment for the {tier} plan "
         f"for {business or 'their business'}. This is not something they typed to you. Write your "
@@ -1946,7 +1997,8 @@ def stripe_webhook():
         if customer_e164:
             try:
                 opening_text = kickoff_onboarding(
-                    customer_e164, email, customer_name, business, tier, session.get("id", "")
+                    customer_e164, email, customer_name, business, tier, session.get("id", ""),
+                    session.get("subscription") or ""
                 )
                 send_sms(customer_e164, opening_text, TWILIO_NUMBER)
                 log_event("onboarding_kickoff_sent", business=business, phone=customer_e164)

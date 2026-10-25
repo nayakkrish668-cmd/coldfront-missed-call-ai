@@ -44,6 +44,7 @@ from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 from twilio.base.exceptions import TwilioException
 from anthropic import Anthropic, APIError
+import stripe
 
 app = Flask(__name__)
 
@@ -81,6 +82,12 @@ EMERGENCY_PHONE = os.environ.get("EMERGENCY_PHONE", "") or TWILIO_NUMBER
 # and no admin account exists yet, every /admin page refuses all access.
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+
+# Signing secret for the Stripe webhook (/stripe-webhook below) — created via
+# the Stripe API, listening for checkout.session.completed on the live
+# account. Without this set, that route refuses every request rather than
+# trust an unsigned POST claiming to be Stripe.
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_LOCKOUT_SECONDS = 300  # 5 minutes
@@ -175,6 +182,19 @@ def init_db():
                 trade TEXT,
                 preferred_design TEXT,
                 page TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS onboarding_threads (
+                phone TEXT PRIMARY KEY,
+                email TEXT,
+                customer_name TEXT,
+                business TEXT,
+                tier TEXT,
+                checkout_session_id TEXT,
                 created_at TEXT NOT NULL
             )
             """
@@ -360,6 +380,30 @@ def mark_sales_thread(phone: str, business: str, trade: str, preferred_design: s
 def get_sales_thread(phone: str) -> dict | None:
     with closing(get_db()) as conn:
         row = conn.execute("SELECT * FROM sales_threads WHERE phone = ?", (phone,)).fetchone()
+        return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------
+# Onboarding — fires from the Stripe webhook the instant a NEW CUSTOMER
+# (not a lead) pays. A phone in this table takes priority over a sales
+# thread for the same number, since the conversation's job has changed
+# from "close them" to "get them set up as a real client."
+# ---------------------------------------------------------------------
+def mark_onboarding_thread(phone: str, email: str, customer_name: str, business: str, tier: str, checkout_session_id: str):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO onboarding_threads (phone, email, customer_name, business, tier, checkout_session_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(phone) DO UPDATE SET email=excluded.email, customer_name=excluded.customer_name, "
+            "business=excluded.business, tier=excluded.tier, checkout_session_id=excluded.checkout_session_id",
+            (phone, email, customer_name, business, tier, checkout_session_id, datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def get_onboarding_thread(phone: str) -> dict | None:
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT * FROM onboarding_threads WHERE phone = ?", (phone,)).fetchone()
         return dict(row) if row else None
 
 
@@ -933,9 +977,153 @@ def kickoff_sales_outreach(phone: str, business: str, trade: str, preferred_desi
         f"website — this is not something they typed to you. Business: {business or 'not given'}. "
         f"Trade: {trade or 'not given'}. Preferred design shown on the page: {preferred_design or 'none specified'}. "
         "Write your opening outbound text to them now — introduce yourself, reference their business, "
-        "and invite them to grab a quick call or ask anything.]"
+        "and invite them to text back with any questions.]"
     )
     return ai_sales_reply(phone, context_note, thread)
+
+
+# ---------------------------------------------------------------------
+# Onboarding AI — fires the instant someone actually pays (Stripe webhook,
+# below). Collects the two things we don't already have from checkout
+# (their trade, and the real phone number their calls should forward to)
+# and, once it has both, alerts Krish with a ready-to-paste client record.
+# He still adds the real Twilio number + forwarding by hand for now via
+# /admin/clients — buying a client their own number is instant, but it
+# can't actually SEND texts until its A2P 10DLC carrier registration
+# clears (same thing the pricing page already tells customers), so fully
+# automating that step wouldn't make it instant anyway; it just adds a
+# second async process to track. Worth revisiting once volume justifies it.
+# ---------------------------------------------------------------------
+ONBOARDING_CAPTURE_TOOL = {
+    "name": "capture_onboarding_info",
+    "description": (
+        "Call this once you have BOTH their trade (what kind of work their business does) "
+        "and the real phone number their missed calls should forward to. This immediately "
+        "alerts Krish with everything needed to set them up as a client. Don't call it with "
+        "guessed values, and don't call it more than once unless something changes."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "trade": {"type": "string", "description": "What their business does, e.g. 'plumbing', 'HVAC', 'electrical'"},
+            "forward_to": {"type": "string", "description": "The real phone number their calls should ring/forward to"},
+        },
+        "required": ["trade", "forward_to"],
+    },
+}
+
+
+def build_onboarding_system_prompt(thread: dict) -> str:
+    business = thread.get("business") or "their business"
+    customer_name = thread.get("customer_name") or "there"
+    tier = thread.get("tier") or "their plan"
+    return f"""You are ColdFront Studio's AI assistant, texting {customer_name}, who JUST PAID for the \
+{tier} plan for their business, {business}. They're already a customer now, not a lead — this \
+conversation is onboarding, not selling.
+
+CRITICAL — this runs entirely over TEXT, never a phone call. You are an AI, and say so plainly if asked.
+
+YOUR ONLY JOB: collect two things, naturally, in a short friendly welcome —
+1. Their trade (what kind of work {business} does — plumbing, HVAC, electrical, etc.)
+2. The real phone number their missed calls should forward to (may be the same number they're texting \
+from, or a different business line — ask, don't assume)
+
+As soon as you have BOTH, call capture_onboarding_info in the SAME turn as your reply, not instead of it. \
+Then let them know Krish will have everything live shortly.
+
+Don't re-pitch them, don't discuss pricing (they already paid), and don't promise a specific setup time \
+beyond "shortly." If they ask something you don't know, say Krish will cover it when he finishes their setup.
+
+STYLE: keep every reply SHORT (1-3 sentences) — this is a text conversation. Warm and efficient, like a \
+good onboarding specialist, not a salesperson. Messages wrapped in [SYSTEM: ...] are internal context \
+notes, not something they said out loud — act on them naturally, never mention "a system note.\""""
+
+
+def notify_owner_of_new_customer(business: str, tier: str, email: str, phone: str, amount_total: int | None):
+    """Fires immediately from the Stripe webhook — before onboarding even
+    starts texting — so Krish never finds out about a sale by checking his
+    email or the Stripe dashboard."""
+    amount = f"${amount_total / 100:,.2f}" if amount_total is not None else "—"
+    body = (
+        "🎉 New customer paid!\n"
+        f"Business: {business or '—'}\n"
+        f"Tier: {tier}\n"
+        f"Email: {email or '—'}\n"
+        f"Phone: {_format_phone_for_display(phone) if phone else '—'}\n"
+        f"Charged today: {amount}\n"
+        "The AI is texting them now to collect their trade + forward-to number."
+    )
+    try:
+        send_sms(FORWARD_TO, body, TWILIO_NUMBER)
+        log_event("new_customer_notified", business=business, tier=tier, email=email)
+    except TwilioException as exc:
+        log_event("new_customer_notify_failed", business=business, error=str(exc))
+
+
+def notify_owner_ready_to_add_client(phone: str, thread: dict, info: dict):
+    """Fires once onboarding has both pieces of info — this is the
+    "paste this into /admin/clients" moment."""
+    body = (
+        "✅ Ready to add as a client\n"
+        f"Business: {thread.get('business') or '—'}\n"
+        f"Trade: {info.get('trade', '—')}\n"
+        f"Forward to: {info.get('forward_to', '—')}\n"
+        f"Customer phone: {_format_phone_for_display(phone)}\n"
+        f"Tier: {thread.get('tier') or '—'}\n"
+        "Add them at /admin/clients once their Twilio number is set up."
+    )
+    try:
+        send_sms(FORWARD_TO, body, TWILIO_NUMBER)
+        log_event("onboarding_complete_notified", phone=phone, info=info)
+    except TwilioException as exc:
+        log_event("onboarding_complete_notify_failed", phone=phone, error=str(exc))
+
+
+def ai_onboarding_reply(phone: str, incoming_text: str, thread: dict) -> str:
+    append_message(phone, "user", incoming_text)
+    history = get_history(phone)
+
+    if ai_client:
+        try:
+            resp = ai_client.messages.create(
+                model="claude-sonnet-5",
+                max_tokens=300,
+                system=build_onboarding_system_prompt(thread),
+                tools=[ONBOARDING_CAPTURE_TOOL],
+                messages=history,
+            )
+            reply_text = ""
+            for block in resp.content:
+                if block.type == "text":
+                    reply_text += block.text
+                elif block.type == "tool_use" and block.name == "capture_onboarding_info":
+                    notify_owner_ready_to_add_client(phone, thread, block.input)
+            reply_text = reply_text.strip() or "Got it, thanks!"
+        except APIError as exc:
+            log_event("onboarding_ai_reply_failed", phone=phone, error=str(exc))
+            reply_text = (
+                "Thanks! I'm having a brief technical hiccup — Krish will follow up by text shortly."
+            )
+    else:
+        reply_text = "Thanks for your payment! Krish will text you shortly to finish setup."
+
+    append_message(phone, "assistant", reply_text)
+    return reply_text
+
+
+def kickoff_onboarding(phone: str, email: str, customer_name: str, business: str, tier: str, checkout_session_id: str) -> str:
+    """Send the AI's own welcome/onboarding text the instant Stripe confirms
+    payment — same pattern as kickoff_sales_outreach, just a different
+    thread table and a different job (collect info, not close a sale)."""
+    mark_onboarding_thread(phone, email, customer_name, business, tier, checkout_session_id)
+    thread = {"business": business, "customer_name": customer_name, "tier": tier}
+    context_note = (
+        f"[SYSTEM: {customer_name or 'This customer'} just completed payment for the {tier} plan "
+        f"for {business or 'their business'}. This is not something they typed to you. Write your "
+        "opening welcome text now — thank them, and ask for their trade and the real forward-to "
+        "number in one short, friendly message.]"
+    )
+    return ai_onboarding_reply(phone, context_note, thread)
 
 
 # ---------------------------------------------------------------------
@@ -1236,6 +1424,29 @@ def sms():
     if message_sid and not claim_request_once(f"sms:{message_sid}"):
         log_event("sms_duplicate_retry_skipped", caller=caller, message_sid=message_sid)
         return Response(str(MessagingResponse()), mimetype="text/xml")
+
+    # A reply from someone who just PAID continues onboarding, not sales —
+    # checked before the sales-thread check below, since a lead who converts
+    # still has an open sales_threads row and we want the newer, more
+    # relevant conversation (collecting setup info) to win.
+    onboarding_thread = get_onboarding_thread(caller)
+    if onboarding_thread:
+        normalized = body.strip().upper()
+        resp = MessagingResponse()
+        if normalized in STOP_KEYWORDS:
+            set_consent(caller, False)
+            log_event("onboarding_sms_opt_out", caller=caller)
+            resp.message("You've been unsubscribed from ColdFront Studio texts. Reply START to resubscribe.")
+            return Response(str(resp), mimetype="text/xml")
+        if normalized in START_KEYWORDS:
+            set_consent(caller, True)
+            log_event("onboarding_sms_opt_in_via_text", caller=caller)
+            resp.message("You're resubscribed to ColdFront Studio texts. Reply STOP at any time to opt out.")
+            return Response(str(resp), mimetype="text/xml")
+        reply_text = ai_onboarding_reply(caller, body, onboarding_thread)
+        log_event("onboarding_ai_reply_sent", caller=caller, reply=reply_text)
+        resp.message(reply_text)
+        return Response(str(resp), mimetype="text/xml")
 
     # A reply from a lead ColdFront's own sales AI already texted first (via
     # /notify-request) continues THAT conversation, regardless of which demo
@@ -1593,6 +1804,71 @@ def register_demo_caller():
     resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
+
+
+# Real Payment Link IDs (Starter / Growth) — used to tag which tier someone
+# just bought. Full-Service has no self-serve link (it's a "talk to us"
+# mailto), so it never reaches this webhook.
+PAYMENT_LINK_TIERS = {
+    "plink_1UQbcFHAFB70lN9eGmYKOKLL": "Starter ($397/mo)",
+    "plink_1UQbcHHAFB70lN9e7I2PWrGd": "Growth ($697/mo)",
+}
+
+
+@app.route("/stripe-webhook", methods=["POST"])
+def stripe_webhook():
+    """Fires the instant a checkout completes on either live Payment Link.
+    Texts Krish immediately, then kicks off the AI onboarding conversation
+    with the new customer — see kickoff_onboarding above for why actual
+    Twilio-number provisioning stays a manual step for now."""
+    if not STRIPE_WEBHOOK_SECRET:
+        log_event("stripe_webhook_no_secret_configured")
+        abort(403)
+
+    payload = request.get_data()
+    signature = request.headers.get("Stripe-Signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, signature, STRIPE_WEBHOOK_SECRET)
+    except (stripe.error.SignatureVerificationError, ValueError) as exc:
+        log_event("stripe_webhook_signature_invalid", error=str(exc))
+        abort(400)
+
+    # Stripe retries a webhook that doesn't get a timely 2xx — same
+    # idempotency pattern as the Twilio webhooks above, keyed by event id.
+    if not claim_request_once(f"stripe:{event['id']}"):
+        log_event("stripe_webhook_duplicate_retry_skipped", event_id=event["id"])
+        return Response("", status=204)
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        customer_details = session.get("customer_details") or {}
+        email = (customer_details.get("email") or "").strip()
+        customer_name = (customer_details.get("name") or "").strip()
+        raw_phone = (customer_details.get("phone") or "").strip()
+        amount_total = session.get("amount_total")
+        tier = PAYMENT_LINK_TIERS.get(session.get("payment_link"), "unknown tier")
+
+        business = ""
+        for field in session.get("custom_fields") or []:
+            if field.get("key") == "business_name":
+                business = ((field.get("text") or {}).get("value") or "").strip()
+
+        notify_owner_of_new_customer(business, tier, email, raw_phone, amount_total)
+
+        customer_e164 = _normalize_us_phone(raw_phone)
+        if customer_e164:
+            try:
+                opening_text = kickoff_onboarding(
+                    customer_e164, email, customer_name, business, tier, session.get("id", "")
+                )
+                send_sms(customer_e164, opening_text, TWILIO_NUMBER)
+                log_event("onboarding_kickoff_sent", business=business, phone=customer_e164)
+            except TwilioException as exc:
+                log_event("onboarding_kickoff_failed", business=business, error=str(exc))
+        else:
+            log_event("onboarding_kickoff_skipped_no_phone", business=business, email=email)
+
+    return Response("", status=204)
 
 
 @app.route("/", methods=["GET"])

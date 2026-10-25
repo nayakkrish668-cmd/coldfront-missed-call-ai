@@ -730,29 +730,56 @@ def ai_reply(caller: str, incoming_text: str, client: dict) -> str:
 # so he can jump in personally any time; this just means the lead never
 # has to wait on that to hear back.
 # ---------------------------------------------------------------------
-SALES_CAPTURE_TOOL = {
-    "name": "capture_callback",
+# Real checkout links (same ones on the pricing section) — the model never
+# types these itself. It only picks a tier; the backend sends the exact
+# URL, so there's zero chance of a hallucinated or stale link going out.
+CHECKOUT_LINKS = {
+    "starter": "https://buy.stripe.com/bJe6oHdG44iebWP3dw3Je04",
+    "growth": "https://buy.stripe.com/00w5kDfOc01Y3qjdSa3Je05",
+}
+
+SEND_CHECKOUT_TOOL = {
+    "name": "send_checkout_link",
     "description": (
-        "Call this once the lead has agreed to a callback/demo call, given a "
-        "day or time that works, or clearly asked to just talk to a real "
-        "person now. This immediately alerts Krish so he can follow up. "
-        "Don't call it with guessed values, and don't call it more than once "
-        "per conversation unless the agreed time actually changes."
+        "Call this the moment the lead says they want to start the trial, sign up, "
+        "or get going — for the Starter or Growth tier only. This immediately texts "
+        "them the real checkout link in a follow-up message (sent right after your "
+        "reply), so don't also try to type a URL yourself. Don't call it more than "
+        "once per conversation unless they change their mind about the tier."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "tier": {
+                "type": "string",
+                "enum": ["starter", "growth"],
+                "description": "Which tier they want to start — Starter ($397/mo) or Growth ($697/mo)",
+            },
+            "business_name": {"type": "string", "description": "The lead's business name"},
+        },
+        "required": ["tier", "business_name"],
+    },
+}
+
+FLAG_FOR_FOLLOWUP_TOOL = {
+    "name": "flag_for_personal_followup",
+    "description": (
+        "Call this when the lead wants Full-Service (no self-serve checkout for that "
+        "tier), has a question only Krish can answer, or explicitly asks to talk to a "
+        "real person — Krish follows up BY TEXT, never a phone call. Don't call it "
+        "with guessed values, and don't call it more than once per conversation unless "
+        "something material changes."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "business_name": {"type": "string", "description": "The lead's business name"},
-            "preferred_time": {
+            "reason": {
                 "type": "string",
-                "description": "Day/time they said works, or 'ASAP' if they just want a call now",
-            },
-            "notes": {
-                "type": "string",
-                "description": "Anything else useful Krish should know before calling (questions asked, objections, which tier they liked)",
+                "description": "Why this needs Krish personally (e.g. 'wants Full-Service pricing', 'asked a custom question')",
             },
         },
-        "required": ["business_name", "preferred_time"],
+        "required": ["business_name", "reason"],
     },
 }
 
@@ -764,10 +791,13 @@ def build_sales_system_prompt(thread: dict) -> str:
     return f"""You are the AI sales assistant for ColdFront Studio, texting a lead who just \
 submitted the "get a free mockup" request form on ColdFront's own marketing site. This lead runs \
 {business}, a {trade} business, and had already scrolled through the full pitch (including the \
-personalized demo and pricing) before requesting this, so they are warm — your job is to keep the \
-conversation moving toward a quick call with Krish (the founder), not to re-explain the whole pitch.
+personalized demo and pricing) before requesting this, so they are warm — your job is to close them \
+over text, not to re-explain the whole pitch.
 
-CRITICAL — you are an AI, and you say so plainly:
+CRITICAL — this business runs entirely over TEXT, never a phone call:
+- Never offer, suggest, or agree to a phone call, with you or with Krish. If a lead asks to "hop on a \
+call" or "talk on the phone," say everything can be handled right here over text, and Krish will text \
+them directly if anything needs his personal touch.
 - If asked directly whether you're a real person, a bot, or an AI, always say yes, you're an AI — \
 never claim or imply you're human. This is itself part of the pitch: you ARE the exact AI missed-call \
 text-back product ColdFront sells, demonstrating itself on this very conversation. It's fine to point \
@@ -778,22 +808,22 @@ Google Business Profile posting.
   - Growth (most popular): $697/mo + $399 setup — everything in Starter, plus automated review requests, \
 SMS appointment reminders, automated quote follow-up.
   - Full-Service: $1,200+/mo + $399 setup — everything in Growth, plus active local SEO, full CRM \
-pipeline management, a dedicated monthly check-in call. (For this tier, say Krish will scope it with them directly.)
+pipeline management, a dedicated monthly check-in call. There's no self-serve checkout for this tier — \
+Krish scopes it personally, by text.
   - All tiers: 7-day trial, no contract, cancel anytime. The $399 setup is charged at checkout; monthly \
 billing starts after the trial.
   - Preferred design they picked on the site: {preferred_design}.
-- Never make up a start date, a technical capability, or promise something not listed above. If asked \
-something you don't know, say Krish will cover it on the call.
+- Never make up a start date, a technical capability, or promise something not listed above.
 
 YOUR GOAL, in order of preference:
-1. Get them to agree to a quick call with Krish and a rough day/time (or "ASAP")
-2. If they'd rather just start the trial now, point them at the pricing section they already saw and \
-say Krish will also follow up to help them pick the right tier
+1. If they want Starter or Growth and seem ready, call send_checkout_link — this texts them the real \
+checkout link right after your reply, so they can start the trial themselves immediately. Don't wait \
+for them to ask twice; once they've said something like "sounds good" or "let's do it," send it.
+2. If they want Full-Service, have a question you genuinely can't answer from the facts above, or \
+explicitly ask for Krish personally, call flag_for_personal_followup — Krish will text them himself, \
+never call.
 3. If they say now's not a good time or they're not interested, thank them briefly and back off — don't \
 be pushy past a clear "no"
-
-As soon as you have a business name and a preferred time (or they ask to just be called now), call \
-capture_callback — in the SAME turn as your reply, not instead of it.
 
 STYLE:
 - Keep every reply SHORT (1-3 sentences) — this is a real text conversation, not an email
@@ -805,22 +835,48 @@ website) are strong enough on their own
 — not something the lead said out loud. Act on them naturally; never mention "a system note" to the lead."""
 
 
+def send_checkout_link_to_lead(phone: str, tier: str, business: str):
+    """The model only picks a tier; this sends the real, hardcoded Stripe
+    link in its own follow-up text so the lead can self-serve start the
+    trial — no call, no waiting on Krish."""
+    link = CHECKOUT_LINKS.get(tier, CHECKOUT_LINKS["starter"])
+    label = "Growth ($697/mo)" if tier == "growth" else "Starter ($397/mo)"
+    body = f"Here's the link to start your {label} 7-day trial: {link}"
+    try:
+        send_sms(phone, body, TWILIO_NUMBER)
+        append_message(phone, "assistant", body)
+        log_event("checkout_link_sent", phone=phone, tier=tier, business=business)
+    except TwilioException as exc:
+        log_event("checkout_link_send_failed", phone=phone, tier=tier, error=str(exc))
+    # Also let Krish know, for visibility only — nothing for him to do.
+    try:
+        send_sms(
+            FORWARD_TO,
+            f"🟢 {business or '—'} just got the {label} checkout link texted to them "
+            f"({_format_phone_for_display(phone)}). No action needed unless they reach out.",
+            TWILIO_NUMBER,
+        )
+    except TwilioException as exc:
+        log_event("checkout_link_owner_notify_failed", phone=phone, error=str(exc))
+
+
 def notify_owner_of_sales_interest(phone: str, info: dict, business: str):
-    """Text Krish when the sales AI gets a lead to agree to a callback time —
-    separate from notify_owner_of_lead (that one's for a client's own
-    missed-call customers, this one's for ColdFront's own prospects)."""
+    """Text Krish when a lead needs him personally — Full-Service, a
+    question the AI couldn't answer, or an explicit ask for a human.
+    Always by TEXT; separate from notify_owner_of_lead (that one's for a
+    client's own missed-call customers, this one's for ColdFront's own
+    prospects)."""
     body = (
-        "🟢 Sales lead ready for a callback\n"
+        "🟡 Lead needs you personally (text them, not a call)\n"
         f"Business: {info.get('business_name') or business or '—'}\n"
         f"Phone: {_format_phone_for_display(phone)}\n"
-        f"Wants: {info.get('preferred_time', '—')}\n"
-        f"Notes: {info.get('notes', '—')}"
+        f"Why: {info.get('reason', '—')}"
     )
     try:
         send_sms(FORWARD_TO, body, TWILIO_NUMBER)
-        log_event("sales_callback_notified", phone=phone, info=info)
+        log_event("sales_followup_notified", phone=phone, info=info)
     except TwilioException as exc:
-        log_event("sales_callback_notify_failed", phone=phone, error=str(exc))
+        log_event("sales_followup_notify_failed", phone=phone, error=str(exc))
 
 
 def ai_sales_reply(phone: str, incoming_text: str, thread: dict) -> str:
@@ -833,17 +889,21 @@ def ai_sales_reply(phone: str, incoming_text: str, thread: dict) -> str:
                 model="claude-sonnet-5",
                 max_tokens=300,
                 system=build_sales_system_prompt(thread),
-                tools=[SALES_CAPTURE_TOOL],
+                tools=[SEND_CHECKOUT_TOOL, FLAG_FOR_FOLLOWUP_TOOL],
                 messages=history,
             )
             reply_text = ""
             for block in resp.content:
                 if block.type == "text":
                     reply_text += block.text
-                elif block.type == "tool_use" and block.name == "capture_callback":
+                elif block.type == "tool_use" and block.name == "send_checkout_link":
+                    send_checkout_link_to_lead(
+                        phone, block.input.get("tier", "starter"), block.input.get("business_name")
+                    )
+                elif block.type == "tool_use" and block.name == "flag_for_personal_followup":
                     notify_owner_of_sales_interest(phone, block.input, thread.get("business"))
             reply_text = reply_text.strip() or (
-                "Got it — I'll let Krish know and he'll reach out shortly!"
+                "Got it — sending that your way now!"
             )
         except APIError as exc:
             log_event("sales_ai_reply_failed", phone=phone, error=str(exc))

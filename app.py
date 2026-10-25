@@ -181,6 +181,16 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS demo_overrides (
+                phone TEXT PRIMARY KEY,
+                business TEXT NOT NULL,
+                trade TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS clients (
                 twilio_number TEXT PRIMARY KEY,
                 business_name TEXT NOT NULL,
@@ -423,18 +433,48 @@ def delete_client(twilio_number: str):
         conn.commit()
 
 
-def resolve_client(to_number: str) -> dict:
+def get_demo_override(phone: str) -> dict | None:
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT * FROM demo_overrides WHERE phone = ?", (phone,)).fetchone()
+        return dict(row) if row else None
+
+
+def mark_demo_override(phone: str, business: str, trade: str):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO demo_overrides (phone, business, trade, created_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(phone) DO UPDATE SET business=excluded.business, trade=excluded.trade, "
+            "created_at=excluded.created_at",
+            (phone, business, trade, datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def resolve_client(to_number: str, caller: str = "") -> dict:
     row = get_client_row(to_number) if to_number else None
-    if not row:
-        return DEFAULT_CLIENT
-    return {
-        "twilio_number": row["twilio_number"],
-        "business_name": row["business_name"],
-        "business_trade": row["business_trade"],
-        "forward_to": row["forward_to"],
-        "emergency_phone": row["emergency_phone"] or row["twilio_number"],
-        "ring_timeout_seconds": row["ring_timeout_seconds"] or RING_TIMEOUT_SECONDS,
-    }
+    if row:
+        return {
+            "twilio_number": row["twilio_number"],
+            "business_name": row["business_name"],
+            "business_trade": row["business_trade"],
+            "forward_to": row["forward_to"],
+            "emergency_phone": row["emergency_phone"] or row["twilio_number"],
+            "ring_timeout_seconds": row["ring_timeout_seconds"] or RING_TIMEOUT_SECONDS,
+        }
+    # No real client owns this number — it's the shared public demo line.
+    # If this caller's number was registered (because they opened their
+    # personalized outreach link with a `phone` param), play the demo back
+    # in character as THEIR business/trade instead of the generic fallback
+    # business. forward_to/emergency_phone/twilio_number stay Krish's own —
+    # a missed demo call should still alert Krish, never the prospect.
+    if caller:
+        override = get_demo_override(caller)
+        if override:
+            demo_client = dict(DEFAULT_CLIENT)
+            demo_client["business_name"] = override["business"] or demo_client["business_name"]
+            demo_client["business_trade"] = override["trade"] or demo_client["business_trade"]
+            return demo_client
+    return DEFAULT_CLIENT
 
 
 # ---------------------------------------------------------------------
@@ -1027,7 +1067,7 @@ def voice_demo_respond():
 def voice():
     caller = request.form.get("From", "unknown")
     to_number = request.form.get("To", "")
-    client = resolve_client(to_number)
+    client = resolve_client(to_number, caller)
     log_event("incoming_call", caller=caller, business=client["business_name"])
 
     # Explicit opt-in: caller must press 1 before we'll text them later if
@@ -1053,7 +1093,7 @@ def voice():
 def voice_opt_in():
     caller = request.form.get("From", "unknown")
     to_number = request.form.get("To", "")
-    client = resolve_client(to_number)
+    client = resolve_client(to_number, caller)
     digits = request.form.get("Digits", "")
     consented = digits.strip() == "1"
     set_consent(caller, consented)
@@ -1085,7 +1125,7 @@ def voice_status():
     caller = request.form.get("From", "unknown")
     call_sid = request.values.get("CallSid", "")
     to_number = request.values.get("To", "")
-    client = resolve_client(to_number)
+    client = resolve_client(to_number, caller)
     # DialCallStatus normally arrives as a POST form field (Twilio's own
     # <Dial action=...> callback does this). But the no-FORWARD_TO fallback
     # above redirects here with it as a URL query param instead, which
@@ -1161,7 +1201,7 @@ def sms():
         resp.message(reply_text)
         return Response(str(resp), mimetype="text/xml")
 
-    client = resolve_client(to_number)
+    client = resolve_client(to_number, caller)
     log_event("incoming_sms", caller=caller, body=body, business=client["business_name"])
 
     # SMS opt-out/help keywords (TCPA / A2P 10DLC compliance). Twilio-level
@@ -1453,6 +1493,39 @@ def notify_request():
                 log_event("sales_outreach_skipped_bad_phone", business=business, phone=phone)
         else:
             log_event("mockup_request_skipped", business=business, phone=phone)
+
+        resp = Response("", status=204)
+
+    resp.headers["Access-Control-Allow-Origin"] = ALLOWED_SITE_ORIGIN
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+
+@app.route("/register-demo-caller", methods=["POST", "OPTIONS"])
+def register_demo_caller():
+    """Called silently from the outreach page itself (fire-and-forget, same
+    pattern as /notify-request) so the shared public demo line — (706)
+    808-2127 — can answer IN CHARACTER as the actual prospect's business and
+    trade instead of the generic fallback, without requiring them to type
+    anything. The outreach link already carries the business's own public
+    phone number as a `phone` URL param (scraped from their Google listing),
+    so if they call the demo line from that same number, we already know
+    who they are. If they call from a different number, it just falls back
+    to the generic demo — no harm, no error, nothing to break."""
+    if request.method == "OPTIONS":
+        resp = Response("", status=204)
+    else:
+        business = request.form.get("business", "").strip()[:120]
+        trade = request.form.get("trade", "").strip()[:60]
+        phone = request.form.get("phone", "").strip()[:30]
+
+        caller_e164 = _normalize_us_phone(phone)
+        if business and trade and caller_e164:
+            mark_demo_override(caller_e164, business, trade)
+            log_event("demo_override_registered", business=business, trade=trade)
+        else:
+            log_event("demo_override_skipped", business=business, trade=trade, phone=phone)
 
         resp = Response("", status=204)
 

@@ -53,6 +53,13 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_NUMBER = os.environ.get("TWILIO_NUMBER", "")  # the number you bought, e.g. +15551234567
 FORWARD_TO = os.environ.get("FORWARD_TO", "")  # the business owner's real phone, e.g. +15559876543
+# The A2P-10DLC-approved Messaging Service every auto-provisioned client
+# number must be attached to, or carriers filter/block its SMS entirely.
+# Defaults to the real "ColdFront Studio / Starter" campaign's service
+# (approved Oct 13, 2026); override via env if a different one is used.
+TWILIO_MESSAGING_SERVICE_SID = os.environ.get(
+    "TWILIO_MESSAGING_SERVICE_SID", "MG98dd1f6a06107af753b2ac3758ed0604"
+)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")  # e.g. https://your-app.onrender.com
 
@@ -1190,6 +1197,26 @@ def provision_client_number(business: str, trade: str, forward_to: str) -> str |
             sms_url=f"{PUBLIC_BASE_URL}/sms",
             sms_method="POST",
         )
+        # A raw number is NOT covered by A2P 10DLC approval on its own —
+        # carriers filter/block its SMS until it's attached to the approved
+        # Messaging Service. Without this, every auto-provisioned client
+        # number would buy fine, forward calls fine, and then silently be
+        # unable to send a single text. Never let this block provisioning:
+        # a failure here gets logged (and surfaced below) rather than
+        # unwinding the number purchase or failing the whole onboarding.
+        if TWILIO_MESSAGING_SERVICE_SID:
+            try:
+                twilio_client.messaging.v1.services(TWILIO_MESSAGING_SERVICE_SID).phone_numbers.create(
+                    phone_number_sid=bought.sid
+                )
+                log_event("number_added_to_messaging_service", business=business, twilio_number=bought.phone_number)
+            except TwilioException as exc:
+                log_event(
+                    "number_messaging_service_attach_failed",
+                    business=business,
+                    twilio_number=bought.phone_number,
+                    error=str(exc),
+                )
         upsert_client(bought.phone_number, business or "New Client", trade or "home services", forward_to)
         log_event("number_provisioned", business=business, twilio_number=bought.phone_number)
         return bought.phone_number

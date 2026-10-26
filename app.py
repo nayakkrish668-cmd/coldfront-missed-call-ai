@@ -2117,6 +2117,57 @@ def register_demo_caller():
     return resp
 
 
+MAX_BULK_DEMO_OVERRIDES = 5000
+
+
+@app.route("/admin/demo-overrides", methods=["POST"])
+@require_admin_auth
+def admin_bulk_demo_overrides():
+    """Bulk version of /register-demo-caller, for cold email batches.
+
+    The outreach page only registers a prospect when they open their link,
+    but the email tells them to call the demo line straight away — so anyone
+    who calls without clicking first got the generic demo. Uploading every
+    lead in a batch before it's sent means the demo answers as their business
+    whether or not they ever open the page.
+
+    Body: {"leads": [{"business": "...", "trade": "...", "phone": "..."}, ...]}
+    """
+    payload = request.get_json(silent=True) or {}
+    leads = payload.get("leads")
+    if not isinstance(leads, list):
+        return {"error": 'expected JSON body {"leads": [...]}'}, 400
+    if len(leads) > MAX_BULK_DEMO_OVERRIDES:
+        return {"error": f"max {MAX_BULK_DEMO_OVERRIDES} leads per request"}, 400
+
+    now = datetime.datetime.utcnow().isoformat()
+    rows, skipped = {}, 0
+    for lead in leads:
+        if not isinstance(lead, dict):
+            skipped += 1
+            continue
+        business = _clean_text(str(lead.get("business", "")), 120)
+        trade = _clean_text(str(lead.get("trade", "")), 60)
+        phone = _normalize_us_phone(str(lead.get("phone", "")))
+        if business and trade and phone:
+            rows[phone] = (phone, business, trade, now)  # last one wins on dupes
+        else:
+            skipped += 1
+
+    if rows:
+        with closing(get_db()) as conn:
+            conn.executemany(
+                "INSERT INTO demo_overrides (phone, business, trade, created_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(phone) DO UPDATE SET business=excluded.business, trade=excluded.trade, "
+                "created_at=excluded.created_at",
+                list(rows.values()),
+            )
+            conn.commit()
+
+    log_event("demo_overrides_bulk_loaded", loaded=len(rows), skipped=skipped)
+    return {"loaded": len(rows), "skipped": skipped}
+
+
 # Real Payment Link IDs (Starter / Growth) — used to tag which tier someone
 # just bought. Full-Service has no self-serve link (it's a "talk to us"
 # mailto), so it never reaches this webhook.

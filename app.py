@@ -243,11 +243,19 @@ def init_db():
                 forward_to TEXT NOT NULL,
                 emergency_phone TEXT,
                 ring_timeout_seconds INTEGER,
+                subscription_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        # subscription_id was added after this table already existed in
+        # production — same ALTER TABLE migration pattern as
+        # onboarding_threads.subscription_id above.
+        try:
+            conn.execute("ALTER TABLE clients ADD COLUMN subscription_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # already has the column
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS admin_users (
@@ -502,6 +510,7 @@ def upsert_client(
     forward_to: str,
     emergency_phone: str | None = None,
     ring_timeout_seconds: int | None = None,
+    subscription_id: str | None = None,
 ):
     now = datetime.datetime.utcnow().isoformat()
     with closing(get_db()) as conn:
@@ -509,14 +518,15 @@ def upsert_client(
             """
             INSERT INTO clients
                 (twilio_number, business_name, business_trade, forward_to,
-                 emergency_phone, ring_timeout_seconds, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 emergency_phone, ring_timeout_seconds, subscription_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(twilio_number) DO UPDATE SET
                 business_name=excluded.business_name,
                 business_trade=excluded.business_trade,
                 forward_to=excluded.forward_to,
                 emergency_phone=excluded.emergency_phone,
                 ring_timeout_seconds=excluded.ring_timeout_seconds,
+                subscription_id=COALESCE(excluded.subscription_id, clients.subscription_id),
                 updated_at=excluded.updated_at
             """,
             (
@@ -526,6 +536,7 @@ def upsert_client(
                 forward_to,
                 emergency_phone,
                 ring_timeout_seconds,
+                subscription_id,
                 now,
                 now,
             ),
@@ -537,6 +548,16 @@ def delete_client(twilio_number: str):
     with closing(get_db()) as conn:
         conn.execute("DELETE FROM clients WHERE twilio_number = ?", (twilio_number,))
         conn.commit()
+
+
+def get_client_by_subscription(subscription_id: str):
+    if not subscription_id:
+        return None
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM clients WHERE subscription_id = ?", (subscription_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def get_demo_override(phone: str) -> dict | None:
@@ -1150,7 +1171,7 @@ def _area_code(e164_phone: str) -> str | None:
     return None
 
 
-def provision_client_number(business: str, trade: str, forward_to: str) -> str | None:
+def provision_client_number(business: str, trade: str, forward_to: str, subscription_id: str = "") -> str | None:
     """Buy a new Twilio number for this client and immediately wire it into
     the clients table with voice/sms webhooks pointed at this same app, so
     call forwarding works within seconds — no waiting on Krish to notice a
@@ -1217,12 +1238,36 @@ def provision_client_number(business: str, trade: str, forward_to: str) -> str |
                     twilio_number=bought.phone_number,
                     error=str(exc),
                 )
-        upsert_client(bought.phone_number, business or "New Client", trade or "home services", forward_to)
+        upsert_client(
+            bought.phone_number, business or "New Client", trade or "home services", forward_to,
+            subscription_id=subscription_id or None,
+        )
         log_event("number_provisioned", business=business, twilio_number=bought.phone_number)
         return bought.phone_number
     except TwilioException as exc:
         log_event("number_provisioning_failed", business=business, error=str(exc))
         return None
+
+
+def release_client_number(twilio_number: str, business: str):
+    """Releases a churned client's real Twilio number back to Twilio
+    (stops the ~$1.15/mo charge) and removes their row from the clients
+    table. Never raises: if Twilio can't find or release the number for
+    any reason, that's logged and Krish is told to clean it up by hand —
+    a billing-side hiccup here should never crash the cancellation
+    webhook. Looks the number up by phone_number rather than trusting a
+    stored SID, since none was ever stored."""
+    if twilio_client:
+        try:
+            matches = twilio_client.incoming_phone_numbers.list(phone_number=twilio_number, limit=1)
+            if matches:
+                matches[0].delete()
+                log_event("number_released", business=business, twilio_number=twilio_number)
+            else:
+                log_event("number_release_not_found_in_twilio", business=business, twilio_number=twilio_number)
+        except TwilioException as exc:
+            log_event("number_release_failed", business=business, twilio_number=twilio_number, error=str(exc))
+    delete_client(twilio_number)
 
 
 TRIAL_LENGTH_DAYS = 7
@@ -1268,7 +1313,7 @@ def complete_onboarding(phone: str, thread: dict, info: dict):
     # beats "never extended."
     extend_trial_to_full_term(thread.get("subscription_id", ""), business)
 
-    new_number = provision_client_number(business, trade, forward_to)
+    new_number = provision_client_number(business, trade, forward_to, thread.get("subscription_id", ""))
     if new_number:
         display_number = _format_phone_for_display(new_number)
         try:
@@ -2112,6 +2157,29 @@ def stripe_webhook():
                 )
             except TwilioException as exc:
                 log_event("onboarding_no_phone_alert_failed", business=business, error=str(exc))
+
+    elif event["type"] == "customer.subscription.deleted":
+        # Fires when a subscription is actually canceled (not just past
+        # due) — the signal that a client has genuinely churned. Without
+        # this, a churned client's real Twilio number keeps billing ~$1.15/mo
+        # forever with nobody using it. Only acts if we can match the
+        # subscription back to a client row; an unmatched subscription
+        # (e.g. one from before this was tracked) is logged, not guessed at.
+        subscription = event["data"]["object"]
+        client = get_client_by_subscription(subscription.get("id", ""))
+        if client:
+            release_client_number(client["twilio_number"], client["business_name"])
+            try:
+                send_sms(
+                    FORWARD_TO,
+                    f"🔌 {client['business_name']} canceled — released their number "
+                    f"({_format_phone_for_display(client['twilio_number'])}) and removed them from active clients.",
+                    TWILIO_NUMBER,
+                )
+            except TwilioException as exc:
+                log_event("churn_release_notify_failed", business=client["business_name"], error=str(exc))
+        else:
+            log_event("subscription_deleted_no_matching_client", subscription_id=subscription.get("id", ""))
 
     return Response("", status=204)
 

@@ -771,6 +771,37 @@ def send_sms(to: str, body: str, from_number: str):
     twilio_client.messages.create(to=to, from_=from_number, body=body)
 
 
+# Uptime monitoring only confirms the server is reachable, not that the AI
+# is actually working — a bad Anthropic key, an exhausted credit balance, or
+# an outage would still return "200 ok" on the health check while every real
+# customer silently gets a canned fallback reply instead of the AI. This is
+# the one thing that actually surfaces that to a human: the first time any
+# of the AI reply paths fails, text the business owner directly. Keyed by
+# `kind` with a cooldown so one bad stretch doesn't send dozens of texts.
+_last_failure_alert: dict[str, float] = {}
+FAILURE_ALERT_COOLDOWN_SECONDS = 1800  # 30 min
+
+
+def alert_owner_of_system_failure(kind: str, detail: str):
+    if not FORWARD_TO:
+        return
+    now = time.time()
+    last = _last_failure_alert.get(kind, 0.0)
+    if now - last < FAILURE_ALERT_COOLDOWN_SECONDS:
+        return
+    _last_failure_alert[kind] = now
+    try:
+        send_sms(
+            FORWARD_TO,
+            f"⚠️ ColdFront system alert: {detail} Customers are getting a "
+            f"fallback reply instead of the real AI response right now. "
+            f"Check Render logs and your Anthropic API balance.",
+            TWILIO_NUMBER,
+        )
+    except TwilioException as exc:
+        log_event("owner_failure_alert_failed", kind=kind, error=str(exc))
+
+
 def notify_owner_of_lead(caller: str, lead: dict, client: dict):
     """Text the client's forward_to number a summary of a captured lead, at
     most once per phone number. This is the thing that actually gets a real
@@ -831,6 +862,7 @@ def ai_reply(caller: str, incoming_text: str, client: dict) -> str:
             # "application error occurred" mid-conversation. Log it and
             # still text back something useful.
             log_event("ai_reply_failed", caller=caller, error=str(exc))
+            alert_owner_of_system_failure("anthropic_api_failure", "The missed-call AI text-back is failing.")
             reply_text = (
                 "Thanks for your message! We're having a brief technical "
                 "hiccup on our end — someone from our team will follow up "
@@ -1034,6 +1066,7 @@ def ai_sales_reply(phone: str, incoming_text: str, thread: dict) -> str:
             )
         except APIError as exc:
             log_event("sales_ai_reply_failed", phone=phone, error=str(exc))
+            alert_owner_of_system_failure("anthropic_api_failure", "The missed-call AI text-back is failing.")
             reply_text = (
                 "Thanks for the reply! I'm having a brief technical hiccup — "
                 "Krish will follow up with you directly shortly."
@@ -1365,6 +1398,9 @@ def ai_onboarding_reply(phone: str, incoming_text: str, thread: dict) -> str:
             reply_text = reply_text.strip() or "Got it, thanks!"
         except APIError as exc:
             log_event("onboarding_ai_reply_failed", phone=phone, error=str(exc))
+            alert_owner_of_system_failure(
+                "anthropic_api_failure", "AI onboarding for a paying customer is failing."
+            )
             reply_text = (
                 "Thanks! I'm having a brief technical hiccup — Krish will follow up by text shortly."
             )
@@ -1477,6 +1513,7 @@ def _demo_ai_reply(call_sid: str, mode: str, caller_said: str) -> str:
             # A crash here would bring down a live voice call mid-sentence —
             # worse than a bad reply, since the caller is on the line right now.
             log_event("demo_ai_reply_failed", call_sid=call_sid, error=str(exc))
+            alert_owner_of_system_failure("anthropic_api_failure", "The missed-call AI text-back is failing.")
             reply_text = (
                 "Sorry, I'm having a brief technical hiccup — but that's the "
                 "idea: this demo answers calls and texts back anyone we miss."
@@ -2187,6 +2224,43 @@ def stripe_webhook():
 @app.route("/", methods=["GET"])
 def health():
     return {"status": "ok", "business": BUSINESS_NAME, "time": str(datetime.datetime.now())}
+
+
+@app.route("/health/deep", methods=["GET"])
+def health_deep():
+    """Unlike `/`, this actually exercises the DB and Twilio credentials —
+    the two things that are free to check on every call. Anthropic is
+    deliberately NOT checked here: a real completion call costs money on
+    every single poll, which would quietly burn the exact API balance this
+    is meant to protect. Anthropic failures are instead caught and alerted
+    on on the real customer-facing call path (see alert_owner_of_system_failure).
+    """
+    checks = {}
+    ok = True
+
+    try:
+        with closing(get_db()) as conn:
+            conn.execute("SELECT 1").fetchone()
+        checks["database"] = "ok"
+    except Exception as exc:
+        checks["database"] = f"error: {exc}"
+        ok = False
+
+    if twilio_client:
+        try:
+            twilio_client.api.accounts(TWILIO_ACCOUNT_SID).fetch()
+            checks["twilio"] = "ok"
+        except TwilioException as exc:
+            checks["twilio"] = f"error: {exc}"
+            ok = False
+    else:
+        checks["twilio"] = "not configured"
+        ok = False
+
+    checks["anthropic_key_present"] = bool(ai_client)
+    checks["stripe_key_present"] = bool(STRIPE_SECRET_KEY)
+
+    return {"status": "ok" if ok else "degraded", "checks": checks}, (200 if ok else 503)
 
 
 if __name__ == "__main__":

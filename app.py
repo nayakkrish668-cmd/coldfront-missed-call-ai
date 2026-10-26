@@ -373,6 +373,39 @@ def _normalize_us_phone(raw: str) -> str | None:
     return None
 
 
+def _clean_text(raw: str, max_len: int = 200) -> str:
+    """Strip control/formatting characters (newlines, tabs, null bytes,
+    anything non-printable) out of anything a visitor typed into a public
+    form before it goes anywhere near an outbound SMS or an AI prompt.
+    Nothing here is sent anywhere a visitor couldn't already see it as
+    plain text, so this isn't a security boundary — it just stops a
+    stray newline from making one submitted field look like multiple SMS
+    lines, or from breaking the formatting of an owner alert."""
+    if not raw:
+        return ""
+    cleaned = "".join(ch for ch in raw if ch == " " or (ch.isprintable() and ch not in "\r\n\t"))
+    return cleaned.strip()[:max_len]
+
+
+# Simple in-memory per-key rate limiting for the public, unauthenticated
+# endpoints below (/notify-request, /register-demo-caller) — each hit costs
+# a real Claude API call and a real Twilio send, with no login and no
+# CAPTCHA in front of it, so without this a bot hitting the form on a loop
+# runs up both bills for free. In-memory is fine here, same reasoning as
+# _failed_logins above: this service runs a single gunicorn worker.
+_endpoint_hits: dict[str, list[float]] = {}
+RATE_LIMIT_WINDOW_SECONDS = 600  # 10 minutes
+RATE_LIMIT_MAX_HITS = 5  # per key, per window
+
+
+def _rate_limited(key: str) -> bool:
+    now = time.time()
+    recent = [t for t in _endpoint_hits.get(key, []) if now - t < RATE_LIMIT_WINDOW_SECONDS]
+    recent.append(now)
+    _endpoint_hits[key] = recent
+    return len(recent) > RATE_LIMIT_MAX_HITS
+
+
 # ---------------------------------------------------------------------
 # ColdFront Studio's OWN sales outreach — separate from the per-client
 # missed-call text-back product above. When a prospect submits the "free
@@ -1122,6 +1155,22 @@ def provision_client_number(business: str, trade: str, forward_to: str) -> str |
     if not twilio_client or not PUBLIC_BASE_URL:
         return None
     try:
+        # Catch a mistyped forward-to number BEFORE wiring a real client
+        # number to it — Twilio Lookup's basic validity check is free (no
+        # `fields` param = no paid add-ons) and catches garbage/malformed
+        # numbers synchronously, rather than silently forwarding calls
+        # nowhere. A lookup failure (network hiccup, rate limit) is treated
+        # as "couldn't confirm it's valid," not "definitely invalid" — we'd
+        # rather provision on an unconfirmed number than block a real
+        # customer's setup over a Twilio Lookup outage.
+        try:
+            lookup = twilio_client.lookups.v2.phone_numbers(forward_to).fetch()
+            if lookup.valid is False:
+                log_event("forward_to_invalid", business=business, forward_to=forward_to)
+                return None
+        except TwilioException as exc:
+            log_event("forward_to_lookup_failed", business=business, forward_to=forward_to, error=str(exc))
+
         area_code = _area_code(forward_to)
         candidates = []
         if area_code:
@@ -1183,10 +1232,18 @@ def complete_onboarding(phone: str, thread: dict, info: dict):
     forward_to_raw = info.get("forward_to", "")
     forward_to = _normalize_us_phone(forward_to_raw) or forward_to_raw
 
+    # Extend the trial regardless of whether auto-provisioning succeeds
+    # below — this was previously only called on the success path, which
+    # meant the one customer whose setup needed Krish's manual help (the
+    # exact case the fairness fix exists for) was the one who never got
+    # it. Not perfect when it falls back to manual (their forwarding may
+    # not actually go live the instant this fires), but "now + 7 days"
+    # beats "never extended."
+    extend_trial_to_full_term(thread.get("subscription_id", ""), business)
+
     new_number = provision_client_number(business, trade, forward_to)
     if new_number:
         display_number = _format_phone_for_display(new_number)
-        extend_trial_to_full_term(thread.get("subscription_id", ""), business)
         try:
             send_sms(
                 FORWARD_TO,
@@ -1863,20 +1920,25 @@ def notify_request():
     never 500 on the visitor, it should just skip the text."""
     if request.method == "OPTIONS":
         resp = Response("", status=204)
+    elif _rate_limited(f"notify-request:{request.remote_addr}"):
+        log_event("notify_request_rate_limited", remote_addr=request.remote_addr)
+        resp = Response("", status=204)
     else:
-        business = request.form.get("business", "").strip()[:120]
-        trade = request.form.get("trade", "").strip()[:60]
-        phone = request.form.get("phone", "").strip()[:30]
-        preferred_design = request.form.get("preferred_design", "").strip()[:40]
-        page = request.form.get("page", "").strip()[:200]
+        business = _clean_text(request.form.get("business", ""), 120)
+        trade = _clean_text(request.form.get("trade", ""), 60)
+        phone = _clean_text(request.form.get("phone", ""), 30)
+        preferred_design = _clean_text(request.form.get("preferred_design", ""), 40)
+        page = _clean_text(request.form.get("page", ""), 200)
 
         if business and phone and FORWARD_TO and TWILIO_NUMBER:
+            lead_e164 = _normalize_us_phone(phone)
             body = (
                 "🔔 New mockup request (outreach site)\n"
                 f"Business: {business}\n"
                 f"Trade: {trade or 'not given'}\n"
-                f"Phone: {phone}\n"
-                f"Preferred design: {preferred_design or 'none picked'}\n"
+                f"Phone: {phone}"
+                + ("" if lead_e164 else " — couldn't parse this as a real US number, AI follow-up text was skipped, you'll need to reach out yourself")
+                + f"\nPreferred design: {preferred_design or 'none picked'}\n"
                 f"Page: {page or 'unknown'}"
             )
             try:
@@ -1890,7 +1952,6 @@ def notify_request():
             # Krish to see the alert above and respond personally. Best-
             # effort: a bad phone number or a hiccup here must never affect
             # the owner alert that already succeeded above.
-            lead_e164 = _normalize_us_phone(phone)
             if lead_e164:
                 try:
                     opening_text = kickoff_sales_outreach(lead_e164, business, trade, preferred_design, page)
@@ -1924,10 +1985,13 @@ def register_demo_caller():
     to the generic demo — no harm, no error, nothing to break."""
     if request.method == "OPTIONS":
         resp = Response("", status=204)
+    elif _rate_limited(f"register-demo-caller:{request.remote_addr}"):
+        log_event("register_demo_caller_rate_limited", remote_addr=request.remote_addr)
+        resp = Response("", status=204)
     else:
-        business = request.form.get("business", "").strip()[:120]
-        trade = request.form.get("trade", "").strip()[:60]
-        phone = request.form.get("phone", "").strip()[:30]
+        business = _clean_text(request.form.get("business", ""), 120)
+        trade = _clean_text(request.form.get("trade", ""), 60)
+        phone = _clean_text(request.form.get("phone", ""), 30)
 
         caller_e164 = _normalize_us_phone(phone)
         if business and trade and caller_e164:
@@ -1980,16 +2044,16 @@ def stripe_webhook():
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         customer_details = session.get("customer_details") or {}
-        email = (customer_details.get("email") or "").strip()
-        customer_name = (customer_details.get("name") or "").strip()
-        raw_phone = (customer_details.get("phone") or "").strip()
+        email = _clean_text(customer_details.get("email") or "", 200)
+        customer_name = _clean_text(customer_details.get("name") or "", 120)
+        raw_phone = _clean_text(customer_details.get("phone") or "", 30)
         amount_total = session.get("amount_total")
         tier = PAYMENT_LINK_TIERS.get(session.get("payment_link"), "unknown tier")
 
         business = ""
         for field in session.get("custom_fields") or []:
             if field.get("key") == "business_name":
-                business = ((field.get("text") or {}).get("value") or "").strip()
+                business = _clean_text((field.get("text") or {}).get("value") or "", 120)
 
         notify_owner_of_new_customer(business, tier, email, raw_phone, amount_total)
 
@@ -2005,7 +2069,22 @@ def stripe_webhook():
             except TwilioException as exc:
                 log_event("onboarding_kickoff_failed", business=business, error=str(exc))
         else:
+            # This is a PAYING customer we now have no text-based way to
+            # reach — the generic "new customer paid" alert above already
+            # went out, but make sure this specific problem can't get lost
+            # in it: a customer who already gave us money and got silence
+            # back is the worst version of this gap.
             log_event("onboarding_kickoff_skipped_no_phone", business=business, email=email)
+            try:
+                send_sms(
+                    FORWARD_TO,
+                    f"⚠️ Couldn't parse a phone number for {business or email or 'the customer above'} "
+                    f"(raw value: \"{raw_phone or 'none given'}\") — no onboarding text was sent. "
+                    f"Reach them by email ({email or 'no email either'}) and set them up by hand.",
+                    TWILIO_NUMBER,
+                )
+            except TwilioException as exc:
+                log_event("onboarding_no_phone_alert_failed", business=business, error=str(exc))
 
     return Response("", status=204)
 

@@ -2210,7 +2210,7 @@ button{{margin-top:1rem;padding:.6rem 1.2rem;cursor:pointer}}
 .msg{{background:#e6f4ea;padding:.6rem .8rem;border-radius:4px;margin-bottom:1rem}}
 nav a{{font-size:.85rem;color:#555}}
 </style></head><body>
-<nav><a href="/admin/users">Manage admin logins &rarr;</a> &nbsp; <a href="/admin/pipeline">Pipelines</a> &nbsp; <a href="/admin/reviews">Google reviews</a></nav>
+<nav><a href="/admin/users">Manage admin logins &rarr;</a> &nbsp; <a href="/admin/pipeline">Pipelines</a> &nbsp; <a href="/admin/reviews">Google reviews</a> &nbsp; <a href="/admin/content">Monthly content</a></nav>
 <h1>Clients</h1>
 {'<p class="msg">' + message + '</p>' if message else ''}
 <table><tr><th>Business</th><th>Twilio #</th><th>Trade</th><th>Forward to</th><th>Emergency #</th><th>Calls</th><th></th></tr>
@@ -3312,6 +3312,10 @@ def run_due_messages(now: datetime.datetime | None = None) -> int:
 
 def run_periodic_jobs(now: datetime.datetime | None = None):
     now = now or _utcnow()
+    try:
+        run_monthly_content(now)
+    except Exception as exc:  # noqa: BLE001 - never block reports/reviews
+        log_event("monthly_content_error", error=str(exc))
     for client in list_clients():
         # Every plan gets the monthly numbers (it's what keeps Starter
         # clients seeing the value); review monitoring is Growth+.
@@ -3667,6 +3671,199 @@ def portal_logout():
 
 
 PORTAL_URL = f"{PUBLIC_BASE_URL.rstrip('/')}/portal"
+
+
+# =====================================================================
+# MONTHLY CONTENT PACK — cuts the manual part of Starter's "2-4 Google
+# Business Profile posts a month" and Full-Service's monthly check-in.
+# On the 1st, Claude drafts each client's posts (and, for Full-Service, a
+# check-in agenda from last month's numbers). Krish reviews and pastes
+# them at /admin/content. Posting itself stays manual until Google
+# approves Business Profile API access.
+# =====================================================================
+CONTENT_MODEL = os.environ.get("CONTENT_MODEL", "claude-sonnet-5")
+POSTS_PER_MONTH = 4
+
+LOCAL_SEO_CHECKLIST = [
+    "Business name, address and phone match exactly on Google, website, Facebook, Yelp, BBB, Angi, Nextdoor",
+    "Primary Google category is the main trade; secondary categories cover each service offered",
+    "Service areas list every city/neighborhood they actually serve",
+    "At least 10 recent job photos uploaded this quarter (before/after, truck, team)",
+    "Every review from the last month has an owner reply",
+    "Q&A section answers the 3-5 questions customers ask most (hours, emergencies, service area, financing)",
+    "Website has one page per main service and mentions the service area cities",
+    "Hours (including holiday hours) are current",
+]
+
+
+def init_content_db():
+    with closing(get_db()) as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS content_packs (
+                client_number TEXT NOT NULL,
+                month TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (client_number, month, kind)
+            )"""
+        )
+        conn.commit()
+
+
+init_content_db()
+
+GBP_POSTS_PROMPT = """Write {n} Google Business Profile posts for {business}, a {trade} business, for {month}.
+
+Rules:
+- Each post: a short title (max 8 words) and a body of 60-120 words, plain text, no hashtags, no emojis.
+- Seasonal and practical: what homeowners need from a {trade} business in {month} (maintenance tips, warning signs, prep for the season), ending with a simple call to action to call or book.
+- Never invent facts about the business: no prices, discounts, years in business, awards, guarantees, license numbers, staff names or claims like "#1" or "best in town".
+- Vary the angle across posts (tip, warning sign, seasonal checklist, "when to call a pro").
+
+Reply with ONLY JSON: [{{"title": "...", "body": "..."}}, ...]"""
+
+CHECKIN_PROMPT = """You're preparing a 20-minute monthly check-in call agenda for {business} ({trade}), a client of a
+missed-call text-back and local marketing service. Last month's numbers:
+
+{report}
+
+Write a short agenda in plain text:
+1. Three bullets summarizing what happened, using ONLY the numbers above (don't invent any).
+2. Two or three questions to ask the owner (e.g. how leads converted, busy/slow seasons, services to push).
+3. Two concrete recommendations for next month based on the numbers (e.g. more review requests if few were sent).
+Keep it under 180 words. No preamble."""
+
+
+def _ai_text(prompt: str, max_tokens: int = 1500) -> str | None:
+    if not ai_client:
+        return None
+    try:
+        resp = ai_client.messages.create(model=CONTENT_MODEL, max_tokens=max_tokens,
+                                         messages=[{"role": "user", "content": prompt}])
+        return "".join(b.text for b in resp.content if b.type == "text").strip()
+    except APIError as exc:
+        log_event("content_ai_failed", error=str(exc))
+        alert_owner_of_system_failure("anthropic_api_failure", "Monthly content drafting is failing.")
+        return None
+
+
+def _save_content(number: str, month: str, kind: str, content: str):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO content_packs (client_number, month, kind, content, created_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(client_number, month, kind) DO UPDATE SET content=excluded.content, created_at=excluded.created_at",
+            (number, month, kind, content, _iso(_utcnow())),
+        )
+        conn.commit()
+
+
+def get_content(number: str, month: str, kind: str) -> str | None:
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT content FROM content_packs WHERE client_number = ? AND month = ? AND kind = ?",
+                           (number, month, kind)).fetchone()
+        return row["content"] if row else None
+
+
+def generate_gbp_posts(client: dict, month_start: datetime.datetime) -> list[dict]:
+    raw = _ai_text(GBP_POSTS_PROMPT.format(n=POSTS_PER_MONTH, business=client["business_name"],
+                                           trade=client["business_trade"], month=month_start.strftime("%B")))
+    try:
+        posts = json.loads(re.search(r"\[.*\]", raw or "", re.S).group(0))
+        posts = [{"title": str(p["title"])[:80], "body": str(p["body"])[:1500]} for p in posts][:POSTS_PER_MONTH]
+    except (AttributeError, ValueError, KeyError, TypeError):
+        return []
+    if posts:
+        _save_content(client["twilio_number"], month_start.strftime("%Y-%m"), "gbp_posts", json.dumps(posts))
+    return posts
+
+
+def generate_checkin(client: dict, now_utc: datetime.datetime) -> str:
+    start, end = month_bounds(client, now_utc, previous=True)
+    text = _ai_text(CHECKIN_PROMPT.format(business=client["business_name"], trade=client["business_trade"],
+                                          report=build_report(client, start, end)), max_tokens=600) or ""
+    if text:
+        _save_content(client["twilio_number"], month_bounds(client, now_utc)[0].strftime("%Y-%m"), "checkin", text)
+    return text
+
+
+def run_monthly_content(now_utc: datetime.datetime | None = None) -> int:
+    """Called from the periodic jobs. Drafts each client's pack once per
+    month (from the 1st, 8am local) and texts Krish when any are ready."""
+    now_utc = now_utc or _utcnow()
+    made = 0
+    for client in list_clients():
+        local = now_utc.astimezone(client_tz(client))
+        if local.day > 7 or (local.day == 1 and local.hour < 8):
+            continue  # only in the first week; a later deploy won't backfill old months
+        month_start = month_bounds(client, now_utc)[0]
+        key = f"content_pack:{client['twilio_number']}:{month_start:%Y-%m}"
+        if _request_key_seen(key):
+            continue
+        # If drafting fails (API down, bad output), try again at most hourly,
+        # not on every 5-minute loop for a week.
+        if not claim_request_once(f"content_attempt:{client['twilio_number']}:{local:%Y-%m-%d-%H}"):
+            continue
+        posts = generate_gbp_posts(client, month_start)
+        if (client.get("plan") or "") == PLAN_FULL:
+            generate_checkin(client, now_utc)
+        if posts:
+            claim_request_once(key)
+            made += 1
+    if made and FORWARD_TO:
+        try:
+            send_sms(FORWARD_TO, f"📝 This month's Google posts are drafted for {made} client"
+                                 f"{'s' if made != 1 else ''}. Review and post: {PUBLIC_BASE_URL.rstrip('/')}/admin/content",
+                     TWILIO_NUMBER)
+        except TwilioException as exc:
+            log_event("content_ready_notify_failed", error=str(exc))
+    return made
+
+
+@app.route("/admin/content", methods=["GET", "POST"])
+@require_admin_auth
+def admin_content():
+    now = _utcnow()
+    message = ""
+    if request.method == "POST":
+        client = get_client_row(request.form.get("client", ""))
+        if client:
+            what = request.form.get("what", "posts")
+            if what == "checkin":
+                ok = bool(generate_checkin(client, now))
+            else:
+                ok = bool(generate_gbp_posts(client, month_bounds(client, now)[0]))
+            message = f"{'Drafted' if ok else 'Could not draft'} {what} for {client['business_name']}."
+    sections = []
+    for client in list_clients():
+        month = month_bounds(client, now)[0]
+        number = client["twilio_number"]
+        posts = json.loads(get_content(number, f"{month:%Y-%m}", "gbp_posts") or "[]")
+        post_html = "".join(
+            f"<div style='margin:.6rem 0'><b>{_esc(p['title'])}</b>"
+            f"<textarea readonly rows='5' style='width:100%;font:inherit;margin-top:.3rem' onclick='this.select()'>"
+            f"{_esc(p['body'])}</textarea></div>" for p in posts
+        ) or "<p class='muted'>No drafts for this month yet.</p>"
+        form = lambda what, label: (f"<form method='POST' style='display:inline'><input type='hidden' name='client' value='{_esc(number)}'>"  # noqa: E731
+                                    f"<input type='hidden' name='what' value='{what}'><button>{label}</button></form> ")
+        extra = ""
+        if (client.get("plan") or "") == PLAN_FULL:
+            agenda = get_content(number, f"{month:%Y-%m}", "checkin")
+            extra = ("<h3>Monthly check-in agenda</h3>"
+                     + (f"<pre style='white-space:pre-wrap'>{_esc(agenda)}</pre>" if agenda else "<p class='muted'>Not drafted yet.</p>")
+                     + form("checkin", "Draft agenda")
+                     + "<h3>Local SEO checklist</h3><ul>" + "".join(f"<li>{_esc(i)}</li>" for i in LOCAL_SEO_CHECKLIST) + "</ul>")
+        sections.append(
+            f"<h2>{_esc(client['business_name'])} <span class='muted'>({PLAN_LABELS.get(client.get('plan') or '', 'no plan set')}, {month:%B})</span></h2>"
+            f"<h3>Google posts</h3>{post_html}{form('posts', 'Redraft posts')}{extra}"
+        )
+    return f"""<html><head><title>Monthly content</title>{_ADMIN_CSS}</head><body>
+<nav><a href='/admin/clients'>&larr; Clients</a></nav><h1>Monthly content</h1>
+{'<p>' + _esc(message) + '</p>' if message else ''}
+<p class='muted'>Drafted automatically on the 1st. Click a post to select it, then paste it into the client's Google
+Business Profile (Add update). Read each one first: the AI is told not to invent prices or claims, but check anyway.</p>
+{''.join(sections) or '<p>No clients yet.</p>'}
+</body></html>"""
 
 
 if __name__ == "__main__":

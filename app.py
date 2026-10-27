@@ -1444,6 +1444,25 @@ def extend_trial_to_full_term(subscription_id: str, business: str):
         log_event("trial_extension_failed", business=business, subscription_id=subscription_id, error=str(exc))
 
 
+ONBOARDING_FORM_URL = "https://onboarding.coldfront.studio/onboarding/"
+
+
+def send_intake_form_link(phone: str):
+    """The website half of the plan needs their logo, photos, services and
+    hours, which the separate intake form collects. Nothing else ever told a
+    paying customer that form exists."""
+    try:
+        send_sms(
+            phone,
+            "For your website: add your logo, a few job photos, your services and hours here "
+            f"(sign in with the email you used at checkout): {ONBOARDING_FORM_URL}",
+            TWILIO_NUMBER,
+        )
+        append_message(phone, "assistant", "[intake form link sent]")
+    except TwilioException as exc:
+        log_event("intake_form_link_failed", phone=phone, error=str(exc))
+
+
 def complete_onboarding(phone: str, thread: dict, info: dict):
     """Dispatched from capture_onboarding_info. Tries to auto-provision a
     real client number first; only falls back to "do it by hand" if that
@@ -1498,10 +1517,12 @@ def complete_onboarding(phone: str, thread: dict, info: dict):
                 TWILIO_NUMBER,
             )
             append_message(phone, "assistant", "[auto-provisioning confirmation sent]")
+            send_intake_form_link(phone)
         except TwilioException as exc:
             log_event("auto_provision_customer_notify_failed", phone=phone, error=str(exc))
     else:
         notify_owner_ready_to_add_client(phone, thread, info)
+        send_intake_form_link(phone)
 
 
 def ai_onboarding_reply(phone: str, incoming_text: str, thread: dict) -> str:

@@ -113,7 +113,11 @@ LOGIN_LOCKOUT_SECONDS = 300  # 5 minutes
 # client" so the very first deployment needs zero database rows. Onboarding
 # client #2 and beyond is done through /admin/clients instead (see below),
 # so adding a new client never requires editing code or redeploying.
+ROUTING_RING_FIRST = "ring_first"
+ROUTING_CARRIER_FORWARD = "carrier_forward"
+
 DEFAULT_CLIENT = {
+    "routing_mode": ROUTING_RING_FIRST,
     "twilio_number": TWILIO_NUMBER,
     "business_name": BUSINESS_NAME,
     "business_trade": BUSINESS_TRADE,
@@ -256,6 +260,18 @@ def init_db():
             conn.execute("ALTER TABLE clients ADD COLUMN subscription_id TEXT")
         except sqlite3.OperationalError:
             pass  # already has the column
+        # routing_mode: how calls reach this client's ColdFront number.
+        #   ring_first      - customers call the ColdFront number directly; it
+        #                     rings forward_to first and texts back if unanswered.
+        #   carrier_forward - the business keeps its existing number and its
+        #                     carrier forwards UNANSWERED calls to ColdFront. The
+        #                     call has already gone unanswered, so we text right
+        #                     away and take a voicemail; ringing forward_to again
+        #                     would bounce straight back here in a loop.
+        try:
+            conn.execute("ALTER TABLE clients ADD COLUMN routing_mode TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS admin_users (
@@ -511,6 +527,7 @@ def upsert_client(
     emergency_phone: str | None = None,
     ring_timeout_seconds: int | None = None,
     subscription_id: str | None = None,
+    routing_mode: str | None = None,
 ):
     now = datetime.datetime.utcnow().isoformat()
     with closing(get_db()) as conn:
@@ -518,8 +535,8 @@ def upsert_client(
             """
             INSERT INTO clients
                 (twilio_number, business_name, business_trade, forward_to,
-                 emergency_phone, ring_timeout_seconds, subscription_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 emergency_phone, ring_timeout_seconds, subscription_id, routing_mode, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(twilio_number) DO UPDATE SET
                 business_name=excluded.business_name,
                 business_trade=excluded.business_trade,
@@ -527,6 +544,7 @@ def upsert_client(
                 emergency_phone=excluded.emergency_phone,
                 ring_timeout_seconds=excluded.ring_timeout_seconds,
                 subscription_id=COALESCE(excluded.subscription_id, clients.subscription_id),
+                routing_mode=COALESCE(excluded.routing_mode, clients.routing_mode),
                 updated_at=excluded.updated_at
             """,
             (
@@ -537,6 +555,7 @@ def upsert_client(
                 emergency_phone,
                 ring_timeout_seconds,
                 subscription_id,
+                routing_mode,
                 now,
                 now,
             ),
@@ -587,6 +606,7 @@ def resolve_client(to_number: str, caller: str = "") -> dict:
             "forward_to": row["forward_to"],
             "emergency_phone": row["emergency_phone"] or row["twilio_number"],
             "ring_timeout_seconds": row["ring_timeout_seconds"] or RING_TIMEOUT_SECONDS,
+            "routing_mode": row.get("routing_mode") or ROUTING_RING_FIRST,
         }
     # No real client owns this number — it's the shared public demo line.
     # If this caller's number was registered (because they opened their
@@ -702,6 +722,12 @@ def validate_twilio_request(f):
 
 
 def build_opt_in_prompt(client: dict) -> str:
+    if client.get("routing_mode") == ROUTING_CARRIER_FORWARD:
+        return (
+            f"Thanks for calling {client['business_name']}. Sorry we couldn't get to the phone. "
+            "Press 1 and we'll text you right now so we can help. "
+            "Message and data rates may apply."
+        )
     return (
         f"Thanks for calling {client['business_name']}. Press 1 to opt in to receive a "
         "follow-up text message if we're unable to answer your call right now. "
@@ -1192,8 +1218,8 @@ def kickoff_sales_outreach(phone: str, business: str, trade: str, preferred_desi
 ONBOARDING_CAPTURE_TOOL = {
     "name": "capture_onboarding_info",
     "description": (
-        "Call this once you have BOTH their trade (what kind of work their business does) "
-        "and the real phone number their missed calls should forward to. This immediately "
+        "Call this once you have their trade (what kind of work their business does), their "
+        "main business number, and the cell number for lead alerts. This immediately "
         "alerts Krish with everything needed to set them up as a client. Don't call it with "
         "guessed values, and don't call it more than once unless something changes."
     ),
@@ -1201,9 +1227,10 @@ ONBOARDING_CAPTURE_TOOL = {
         "type": "object",
         "properties": {
             "trade": {"type": "string", "description": "What their business does, e.g. 'plumbing', 'HVAC', 'electrical'"},
-            "forward_to": {"type": "string", "description": "The real phone number their calls should ring/forward to"},
+            "business_phone": {"type": "string", "description": "Their main business number, the one customers already call"},
+            "forward_to": {"type": "string", "description": "The cell number where new-lead alerts should be texted"},
         },
-        "required": ["trade", "forward_to"],
+        "required": ["trade", "business_phone", "forward_to"],
     },
 }
 
@@ -1218,13 +1245,20 @@ conversation is onboarding, not selling.
 
 CRITICAL — this runs entirely over TEXT, never a phone call. You are an AI, and say so plainly if asked.
 
-YOUR ONLY JOB: collect two things, naturally, in a short friendly welcome —
+YOUR ONLY JOB: collect these, naturally, in a short friendly welcome —
 1. Their trade (what kind of work {business} does — plumbing, HVAC, electrical, etc.)
-2. The real phone number their missed calls should forward to (may be the same number they're texting \
-from, or a different business line — ask, don't assume)
+2. Their main business phone number — the one customers already call (from Google, their trucks, \
+their website).
+3. A cell phone number where they want new-lead alerts texted (often the owner's cell — may be the \
+same number they're texting from; ask, don't assume).
 
-As soon as you have BOTH, call capture_onboarding_info in the SAME turn as your reply, not instead of it. \
-Then let them know their number is being set up right now and a confirmation text is coming in a moment.
+How it works, if they ask: they KEEP their existing business number. We give them a ColdFront number \
+behind the scenes, and they set their current line to forward unanswered calls to it, so every call \
+they miss gets a text back and they still get voicemails. Nothing changes on Google or their trucks.
+
+As soon as you have all three, call capture_onboarding_info in the SAME turn as your reply, not instead \
+of it. Then let them know their setup is happening right now and the next text will have their one \
+last step.
 
 Don't re-pitch them, don't discuss pricing (they already paid), and don't promise a specific setup time \
 beyond "shortly." If they ask something you don't know, say Krish will cover it when he finishes their setup.
@@ -1283,7 +1317,10 @@ def _area_code(e164_phone: str) -> str | None:
     return None
 
 
-def provision_client_number(business: str, trade: str, forward_to: str, subscription_id: str = "") -> str | None:
+def provision_client_number(
+    business: str, trade: str, forward_to: str, subscription_id: str = "",
+    routing_mode: str = ROUTING_RING_FIRST, emergency_phone: str | None = None,
+) -> str | None:
     """Buy a new Twilio number for this client and immediately wire it into
     the clients table with voice/sms webhooks pointed at this same app, so
     call forwarding works within seconds — no waiting on Krish to notice a
@@ -1352,7 +1389,9 @@ def provision_client_number(business: str, trade: str, forward_to: str, subscrip
                 )
         upsert_client(
             bought.phone_number, business or "New Client", trade or "home services", forward_to,
+            emergency_phone=emergency_phone,
             subscription_id=subscription_id or None,
+            routing_mode=routing_mode,
         )
         log_event("number_provisioned", business=business, twilio_number=bought.phone_number)
         return bought.phone_number
@@ -1415,6 +1454,8 @@ def complete_onboarding(phone: str, thread: dict, info: dict):
     trade = info.get("trade", "")
     forward_to_raw = info.get("forward_to", "")
     forward_to = _normalize_us_phone(forward_to_raw) or forward_to_raw
+    business_phone_raw = info.get("business_phone", "")
+    business_phone = _normalize_us_phone(business_phone_raw) or business_phone_raw or None
 
     # Extend the trial regardless of whether auto-provisioning succeeds
     # below — this was previously only called on the success path, which
@@ -1425,15 +1466,21 @@ def complete_onboarding(phone: str, thread: dict, info: dict):
     # beats "never extended."
     extend_trial_to_full_term(thread.get("subscription_id", ""), business)
 
-    new_number = provision_client_number(business, trade, forward_to, thread.get("subscription_id", ""))
+    new_number = provision_client_number(
+        business, trade, forward_to, thread.get("subscription_id", ""),
+        routing_mode=ROUTING_CARRIER_FORWARD, emergency_phone=business_phone,
+    )
     if new_number:
         display_number = _format_phone_for_display(new_number)
         try:
             send_sms(
                 FORWARD_TO,
-                f"✅ Auto-provisioned {display_number} for {business or '—'} ({trade}), "
-                f"forwarding to {_format_phone_for_display(forward_to)}. Call forwarding is live now. "
-                "Text-back activates once carrier (A2P) registration clears — usually within a day or two.",
+                f"✅ Auto-provisioned {display_number} for {business or '—'} ({trade}). "
+                f"Their business line: {_format_phone_for_display(business_phone) if business_phone else '—'}. "
+                f"Lead alerts go to {_format_phone_for_display(forward_to)}.\n"
+                "THEY STILL NEED TO: forward unanswered calls on their business line to "
+                f"{display_number}. They were told to reply with their carrier; send them the exact "
+                "steps and test-call their line once it's on. Text-back activates once A2P clears.",
                 TWILIO_NUMBER,
             )
         except TwilioException as exc:
@@ -1441,11 +1488,13 @@ def complete_onboarding(phone: str, thread: dict, info: dict):
         try:
             send_sms(
                 phone,
-                f"You're all set! Your number is {display_number} — save it, this is what customers will "
-                "see and call. Call forwarding is live right now. Text-back (texting anyone you miss) "
-                "switches on automatically once carrier registration clears, usually within a day or two. "
-                f"Your {TRIAL_LENGTH_DAYS}-day trial starts counting from right now, not from when you paid, "
-                "so you get the full trial on a working system.",
+                f"You're almost set! Your ColdFront number is {display_number}. You keep your current "
+                "business number; customers never see this one. One last step: set your business line to "
+                f"forward UNANSWERED calls to {display_number} (most phone companies do this with a short "
+                "dial code or a setting in your phone or VoIP app). Reply with your phone company's name "
+                "and Krish will text you the exact steps. Text-back switches on once carrier registration "
+                f"clears, usually within a day or two. Your {TRIAL_LENGTH_DAYS}-day trial starts counting "
+                "from right now, not from when you paid.",
                 TWILIO_NUMBER,
             )
             append_message(phone, "assistant", "[auto-provisioning confirmation sent]")
@@ -1731,6 +1780,27 @@ def voice_opt_in():
     log_event("sms_opt_in", caller=caller, consented=consented, digits_received=digits)
 
     vr = VoiceResponse()
+    if client.get("routing_mode") == ROUTING_CARRIER_FORWARD:
+        # The business's own line already rang out before the carrier sent
+        # this call here, so don't ring anyone again — text now (if they
+        # pressed 1) and take a voicemail, since forwarding unanswered calls
+        # here means their old voicemail never gets them.
+        call_sid = request.values.get("CallSid", "")
+        if consented and (not call_sid or claim_request_once(f"voice_status:{call_sid}")):
+            send_missed_call_text(caller, client)
+        lead_in = "We just sent you a text. " if consented else ""
+        vr.say(f"{lead_in}To leave a voicemail instead, speak after the tone, then hang up.")
+        vr.record(
+            max_length=120,
+            play_beep=True,
+            action=f"{PUBLIC_BASE_URL}/voice/voicemail-done",
+            method="POST",
+            recording_status_callback=f"{PUBLIC_BASE_URL}/voice/voicemail",
+            recording_status_callback_method="POST",
+        )
+        vr.hangup()
+        return Response(str(vr), mimetype="text/xml")
+
     if client["forward_to"]:
         dial = Dial(
             timeout=client["ring_timeout_seconds"],
@@ -1750,6 +1820,60 @@ def voice_opt_in():
 # Voice status callback: fires after the Dial attempt finishes.
 # If it wasn't answered, text the caller immediately.
 # ---------------------------------------------------------------------
+def send_missed_call_text(caller: str, client: dict):
+    body = (
+        f"Hey! Sorry we missed your call at {client['business_name']}. "
+        f"What can we help with? (Reply here and we'll get right back to you.)"
+    )
+    try:
+        send_sms(caller, body, client["twilio_number"])
+        log_event("missed_call_text_sent", caller=caller)
+    except TwilioException as exc:
+        log_event("missed_call_text_failed", caller=caller, error=str(exc))
+
+
+@app.route("/voice/voicemail-done", methods=["POST"])
+@validate_twilio_request
+def voice_voicemail_done():
+    # <Record>'s action: without it Twilio re-requests the same TwiML and
+    # the caller hears the prompt again in a loop.
+    vr = VoiceResponse()
+    vr.hangup()
+    return Response(str(vr), mimetype="text/xml")
+
+
+@app.route("/voice/voicemail", methods=["POST"])
+@validate_twilio_request
+def voice_voicemail():
+    """Recording finished: text the owner the voicemail link."""
+    caller = request.values.get("From", "unknown")
+    to_number = request.values.get("To", "")
+    recording_sid = request.values.get("RecordingSid", "")
+    recording_url = request.values.get("RecordingUrl", "")
+    try:
+        duration = int(request.values.get("RecordingDuration", "0") or 0)
+    except ValueError:
+        duration = 0
+    if recording_sid and not claim_request_once(f"voicemail:{recording_sid}"):
+        return Response("", status=204)
+    client = resolve_client(to_number, caller)
+    if duration < 2 or not recording_url or not client["forward_to"]:
+        log_event("voicemail_skipped", caller=caller, duration=duration)
+        return Response("", status=204)
+    try:
+        send_sms(
+            client["forward_to"],
+            f"📞 New voicemail ({duration}s) for {client['business_name']}\n"
+            f"From: {_format_phone_for_display(caller)}\n"
+            f"Listen: {recording_url}.mp3",
+            client["twilio_number"],
+        )
+        log_event("voicemail_owner_notified", caller=caller, duration=duration)
+    except TwilioException as exc:
+        log_event("voicemail_owner_notify_failed", caller=caller, error=str(exc))
+    return Response("", status=204)
+
+
 @app.route("/voice/status", methods=["POST"])
 @validate_twilio_request
 def voice_status():
@@ -1772,12 +1896,7 @@ def voice_status():
         if call_sid and not claim_request_once(f"voice_status:{call_sid}"):
             log_event("voice_status_duplicate_retry_skipped", caller=caller, call_sid=call_sid)
         elif has_consent(caller):
-            body = (
-                f"Hey! Sorry we missed your call at {client['business_name']}. "
-                f"What can we help with? (Reply here and we'll get right back to you.)"
-            )
-            send_sms(caller, body, client["twilio_number"])
-            log_event("missed_call_text_sent", caller=caller)
+            send_missed_call_text(caller, client)
         else:
             log_event("missed_call_no_consent_skipped", caller=caller)
     vr.hangup()
@@ -1967,13 +2086,16 @@ def admin_clients():
             emergency_phone = request.form.get("emergency_phone", "").strip() or None
             ring_timeout_raw = request.form.get("ring_timeout_seconds", "").strip()
             ring_timeout_seconds = int(ring_timeout_raw) if ring_timeout_raw.isdigit() else None
+            routing_mode = request.form.get("routing_mode", "")
+            if routing_mode not in (ROUTING_RING_FIRST, ROUTING_CARRIER_FORWARD):
+                routing_mode = None  # keep whatever the client already has
 
             if not (twilio_number and business_name and business_trade and forward_to):
                 message = "Twilio number, business name, trade, and forward-to number are all required."
             else:
                 upsert_client(
                     twilio_number, business_name, business_trade, forward_to,
-                    emergency_phone, ring_timeout_seconds,
+                    emergency_phone, ring_timeout_seconds, routing_mode=routing_mode,
                 )
                 message = f"Saved {business_name} ({twilio_number}). Point that number's " \
                           f"Twilio webhooks at this app and it's live — no deploy needed."
@@ -1985,6 +2107,7 @@ def admin_clients():
                 <td>{c['business_name']}</td><td>{c['twilio_number']}</td>
                 <td>{c['business_trade']}</td><td>{c['forward_to']}</td>
                 <td>{c['emergency_phone'] or '—'}</td>
+                <td>{'Keeps own number' if c.get('routing_mode') == ROUTING_CARRIER_FORWARD else 'Rings first'}</td>
                 <td><form method="POST" style="display:inline" onsubmit="return confirm('Remove {c['business_name']}?')">
                     <input type="hidden" name="action" value="delete">
                     <input type="hidden" name="twilio_number" value="{c['twilio_number']}">
@@ -1994,7 +2117,7 @@ def admin_clients():
         )
     else:
         rows_html = (
-            f"<tr><td colspan='6'>No per-client rows yet — "
+            f"<tr><td colspan='7'>No per-client rows yet — "
             f"{DEFAULT_CLIENT['business_name']} ({DEFAULT_CLIENT['twilio_number'] or 'TWILIO_NUMBER not set'}) "
             f"is running on the built-in default config from env vars.</td></tr>"
         )
@@ -2014,7 +2137,7 @@ nav a{{font-size:.85rem;color:#555}}
 <nav><a href="/admin/users">Manage admin logins &rarr;</a></nav>
 <h1>Clients</h1>
 {'<p class="msg">' + message + '</p>' if message else ''}
-<table><tr><th>Business</th><th>Twilio #</th><th>Trade</th><th>Forward to</th><th>Emergency #</th><th></th></tr>
+<table><tr><th>Business</th><th>Twilio #</th><th>Trade</th><th>Forward to</th><th>Emergency #</th><th>Calls</th><th></th></tr>
 {rows_html}
 </table>
 <h2>Add / update a client</h2>
@@ -2031,6 +2154,12 @@ nav a{{font-size:.85rem;color:#555}}
 <input name="emergency_phone">
 <label>Ring timeout, seconds (optional — defaults to {RING_TIMEOUT_SECONDS})</label>
 <input name="ring_timeout_seconds">
+<label>How calls reach this number</label>
+<select name="routing_mode" style="width:100%;padding:.5rem;margin-top:.2rem">
+<option value="">(keep current setting)</option>
+<option value="{ROUTING_CARRIER_FORWARD}">Keeps own number: their line forwards UNANSWERED calls here (text right away + voicemail)</option>
+<option value="{ROUTING_RING_FIRST}">Customers call this number: ring the forward-to phone first, text if no answer</option>
+</select>
 <button type="submit">Save client</button>
 </form>
 </body></html>"""

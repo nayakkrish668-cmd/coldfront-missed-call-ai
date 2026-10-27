@@ -853,6 +853,7 @@ def notify_owner_of_lead(caller: str, lead: dict, client: dict):
     try:
         send_sms(forward_to, body, client["twilio_number"])
         log_event("owner_notified", caller=caller, lead=lead)
+        record_event(client["twilio_number"], "lead_captured", caller, lead.get("issue_description", "")[:200])
     except TwilioException as exc:
         # Never let a failed owner-notification crash the customer's reply —
         # the customer still needs their text even if this alert fails.
@@ -1463,6 +1464,21 @@ def send_intake_form_link(phone: str):
         log_event("intake_form_link_failed", phone=phone, error=str(exc))
 
 
+def send_growth_howto(owner_phone: str, client_number: str):
+    client = get_client_row(client_number)
+    if not client or not owner_phone:
+        return
+    try:
+        send_sms(
+            owner_phone,
+            owner_help_text(client) + "\nStart with your review link: Google Business Profile > Ask for reviews > copy, "
+            "then text 'reviewlink <link>'.",
+            TWILIO_NUMBER,
+        )
+    except TwilioException as exc:
+        log_event("growth_howto_failed", error=str(exc))
+
+
 def complete_onboarding(phone: str, thread: dict, info: dict):
     """Dispatched from capture_onboarding_info. Tries to auto-provision a
     real client number first; only falls back to "do it by hand" if that
@@ -1490,6 +1506,8 @@ def complete_onboarding(phone: str, thread: dict, info: dict):
         routing_mode=ROUTING_CARRIER_FORWARD, emergency_phone=business_phone,
     )
     if new_number:
+        plan = plan_from_tier(thread.get("tier", ""))
+        update_client_fields(new_number, plan=plan, timezone=DEFAULT_TIMEZONE)
         display_number = _format_phone_for_display(new_number)
         try:
             send_sms(
@@ -1518,6 +1536,8 @@ def complete_onboarding(phone: str, thread: dict, info: dict):
             )
             append_message(phone, "assistant", "[auto-provisioning confirmation sent]")
             send_intake_form_link(phone)
+            if plan in (PLAN_GROWTH, PLAN_FULL):
+                send_growth_howto(forward_to, new_number)
         except TwilioException as exc:
             log_event("auto_provision_customer_notify_failed", phone=phone, error=str(exc))
     else:
@@ -1807,6 +1827,10 @@ def voice_opt_in():
         # pressed 1) and take a voicemail, since forwarding unanswered calls
         # here means their old voicemail never gets them.
         call_sid = request.values.get("CallSid", "")
+        if not call_sid or not _request_key_seen(f"missed_call_event:{call_sid}"):
+            if call_sid:
+                claim_request_once(f"missed_call_event:{call_sid}")
+            record_event(client["twilio_number"], "missed_call", caller)
         if consented and (not call_sid or claim_request_once(f"voice_status:{call_sid}")):
             send_missed_call_text(caller, client)
         lead_in = "We just sent you a text. " if consented else ""
@@ -1849,6 +1873,7 @@ def send_missed_call_text(caller: str, client: dict):
     try:
         send_sms(caller, body, client["twilio_number"])
         log_event("missed_call_text_sent", caller=caller)
+        record_event(client["twilio_number"], "missed_call_texted", caller)
     except TwilioException as exc:
         log_event("missed_call_text_failed", caller=caller, error=str(exc))
 
@@ -1890,6 +1915,7 @@ def voice_voicemail():
             client["twilio_number"],
         )
         log_event("voicemail_owner_notified", caller=caller, duration=duration)
+        record_event(client["twilio_number"], "voicemail", caller, str(duration))
     except TwilioException as exc:
         log_event("voicemail_owner_notify_failed", caller=caller, error=str(exc))
     return Response("", status=204)
@@ -1910,6 +1936,8 @@ def voice_status():
     log_event("call_status", caller=caller, status=call_status, business=client["business_name"])
 
     vr = VoiceResponse()
+    if call_status in ("no-answer", "busy", "failed", "canceled") and (not call_sid or not _request_key_seen(f"voice_status:{call_sid}")):
+        record_event(client["twilio_number"], "missed_call", caller)
     if call_status in ("no-answer", "busy", "failed", "canceled"):
         # Twilio retries this webhook if it doesn't get a timely response
         # (cold-start delay on the free tier is a real way to trigger that).
@@ -1947,6 +1975,16 @@ def sms():
     if message_sid and not claim_request_once(f"sms:{message_sid}"):
         log_event("sms_duplicate_retry_skipped", caller=caller, message_sid=message_sid)
         return Response(str(MessagingResponse()), mimetype="text/xml")
+
+    # The business owner texting their OWN ColdFront number from their cell
+    # is a command ("done 4045551234 John"), not a customer conversation.
+    # Checked first: an owner also has an onboarding thread from signup.
+    owner_client = get_client_row(to_number) if to_number else None
+    if owner_client and _same_phone(caller, owner_client["forward_to"]):
+        resp = MessagingResponse()
+        resp.message(handle_owner_command(owner_client, body))
+        log_event("owner_command", client=to_number, command=body[:40])
+        return Response(str(resp), mimetype="text/xml")
 
     # A reply from someone who just PAID continues onboarding, not sales —
     # checked before the sales-thread check below, since a lead who converts
@@ -2041,6 +2079,13 @@ def sms():
         resp.message(reply_text)
         return Response(str(resp), mimetype="text/xml")
 
+    if not is_demo_line:
+        client_row = get_client_row(to_number)
+        direct = handle_customer_reply(client_row, caller, body, normalized) if client_row else None
+        if direct:
+            resp.message(direct)
+            return Response(str(resp), mimetype="text/xml")
+
     state: dict = {}
     reply_text = ai_reply(caller, body, client, state)
     log_event("ai_reply_sent", caller=caller, reply=reply_text)
@@ -2110,6 +2155,13 @@ def admin_clients():
             routing_mode = request.form.get("routing_mode", "")
             if routing_mode not in (ROUTING_RING_FIRST, ROUTING_CARRIER_FORWARD):
                 routing_mode = None  # keep whatever the client already has
+            growth_fields = {k: request.form.get(k, "").strip() for k in ("plan", "timezone", "review_link", "place_id")}
+            growth_fields = {k: v for k, v in growth_fields.items() if v}
+            if growth_fields.get("timezone"):
+                try:
+                    ZoneInfo(growth_fields["timezone"])
+                except Exception:  # noqa: BLE001
+                    growth_fields.pop("timezone")
 
             if not (twilio_number and business_name and business_trade and forward_to):
                 message = "Twilio number, business name, trade, and forward-to number are all required."
@@ -2118,6 +2170,7 @@ def admin_clients():
                     twilio_number, business_name, business_trade, forward_to,
                     emergency_phone, ring_timeout_seconds, routing_mode=routing_mode,
                 )
+                update_client_fields(twilio_number, **growth_fields)
                 message = f"Saved {business_name} ({twilio_number}). Point that number's " \
                           f"Twilio webhooks at this app and it's live — no deploy needed."
 
@@ -2128,7 +2181,9 @@ def admin_clients():
                 <td>{c['business_name']}</td><td>{c['twilio_number']}</td>
                 <td>{c['business_trade']}</td><td>{c['forward_to']}</td>
                 <td>{c['emergency_phone'] or '—'}</td>
-                <td>{'Keeps own number' if c.get('routing_mode') == ROUTING_CARRIER_FORWARD else 'Rings first'}</td>
+                <td>{'Keeps own number' if c.get('routing_mode') == ROUTING_CARRIER_FORWARD else 'Rings first'}<br>
+                    {PLAN_LABELS.get(c.get('plan') or '', 'Plan not set')} ·
+                    <a href="/admin/pipeline?client={c['twilio_number'].replace('+', '%2B')}">pipeline</a></td>
                 <td><form method="POST" style="display:inline" onsubmit="return confirm('Remove {c['business_name']}?')">
                     <input type="hidden" name="action" value="delete">
                     <input type="hidden" name="twilio_number" value="{c['twilio_number']}">
@@ -2155,7 +2210,7 @@ button{{margin-top:1rem;padding:.6rem 1.2rem;cursor:pointer}}
 .msg{{background:#e6f4ea;padding:.6rem .8rem;border-radius:4px;margin-bottom:1rem}}
 nav a{{font-size:.85rem;color:#555}}
 </style></head><body>
-<nav><a href="/admin/users">Manage admin logins &rarr;</a></nav>
+<nav><a href="/admin/users">Manage admin logins &rarr;</a> &nbsp; <a href="/admin/pipeline">Pipelines</a> &nbsp; <a href="/admin/reviews">Google reviews</a></nav>
 <h1>Clients</h1>
 {'<p class="msg">' + message + '</p>' if message else ''}
 <table><tr><th>Business</th><th>Twilio #</th><th>Trade</th><th>Forward to</th><th>Emergency #</th><th>Calls</th><th></th></tr>
@@ -2181,6 +2236,16 @@ nav a{{font-size:.85rem;color:#555}}
 <option value="{ROUTING_CARRIER_FORWARD}">Keeps own number: their line forwards UNANSWERED calls here (text right away + voicemail)</option>
 <option value="{ROUTING_RING_FIRST}">Customers call this number: ring the forward-to phone first, text if no answer</option>
 </select>
+<label>Plan</label>
+<select name="plan" style="width:100%;padding:.5rem;margin-top:.2rem">
+<option value="">(keep current)</option><option value="starter">Starter</option><option value="growth">Growth</option><option value="full">Full-Service</option>
+</select>
+<label>Timezone (optional, e.g. America/Chicago; defaults to {DEFAULT_TIMEZONE})</label>
+<input name="timezone">
+<label>Google review link (optional — the owner can also text "reviewlink ...")</label>
+<input name="review_link">
+<label>Google place ID (optional — turns on daily review monitoring)</label>
+<input name="place_id">
 <button type="submit">Save client</button>
 </form>
 </body></html>"""
@@ -2553,6 +2618,853 @@ def health_deep():
     checks["stripe_key_present"] = bool(STRIPE_SECRET_KEY)
 
     return {"status": "ok" if ok else "degraded", "checks": checks}, (200 if ok else 503)
+
+
+# =====================================================================
+# GROWTH / FULL-SERVICE FEATURES
+#
+# Everything here is driven by the business owner texting commands to
+# their own ColdFront number from their cell (the client's forward_to),
+# e.g. "done 4045551234 John" -> ask that customer for a Google review.
+# A background thread sends anything scheduled (quote follow-ups,
+# appointment reminders, review requests held for quiet hours) and runs
+# the monthly report + daily review check.
+# =====================================================================
+import json
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from zoneinfo import ZoneInfo
+
+DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE", "America/New_York")
+GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
+PARSE_MODEL = os.environ.get("PARSE_MODEL", "claude-haiku-5-5")
+
+# Texts to a client's customers only go out between these local hours
+# (recipient's business timezone). "On our way" is the one exception: it's
+# sent the moment the owner asks, since they're literally driving over.
+SEND_WINDOW_START_HOUR = 9
+SEND_WINDOW_END_HOUR = 20
+QUOTE_FOLLOWUP_DAYS = (2, 5, 10)
+QUOTE_FOLLOWUP_HOUR = 10
+REVIEW_REQUEST_REPEAT_DAYS = 90  # don't ask the same customer twice in this window
+
+PLAN_STARTER, PLAN_GROWTH, PLAN_FULL = "starter", "growth", "full"
+PLAN_LABELS = {PLAN_STARTER: "Starter", PLAN_GROWTH: "Growth", PLAN_FULL: "Full-Service"}
+CONFIRM_KEYWORDS = {"C", "CONFIRM", "CONFIRMED", "CONFIRMING"}
+
+PIPELINE_STAGES = [
+    ("missed_call", "Missed call"),
+    ("missed_call_texted", "Texted back"),
+    ("customer_text", "Replied"),
+    ("lead_captured", "Lead captured"),
+    ("quote_started", "Quoted"),
+    ("quote_replied", "Replied to quote"),
+    ("appt_scheduled", "Booked"),
+    ("appt_rescheduled", "Booked"),
+    ("appt_confirmed", "Confirmed"),
+    ("review_request_sent", "Review requested"),
+]
+STAGE_RANK = {k: i for i, (k, _) in enumerate(PIPELINE_STAGES)}
+
+
+def init_growth_db():
+    with closing(get_db()) as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS client_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_number TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                contact TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_client_events ON client_events (client_number, created_at)")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS scheduled_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_number TEXT NOT NULL,
+                to_phone TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                body TEXT NOT NULL,
+                send_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                sent_at TEXT,
+                error TEXT
+            )"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sched_due ON scheduled_messages (status, send_at)")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS seen_reviews (
+                client_number TEXT NOT NULL,
+                review_key TEXT NOT NULL,
+                rating INTEGER,
+                author TEXT,
+                text TEXT,
+                published TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (client_number, review_key)
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS review_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_number TEXT NOT NULL,
+                rating REAL,
+                review_count INTEGER,
+                checked_at TEXT NOT NULL
+            )"""
+        )
+        for col in ("plan", "timezone", "review_link", "place_id"):
+            try:
+                conn.execute(f"ALTER TABLE clients ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass
+        conn.commit()
+
+
+init_growth_db()
+
+
+# ---------------------------------------------------------------- helpers
+
+def _utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _iso(dt: datetime.datetime) -> str:
+    return dt.astimezone(datetime.timezone.utc).isoformat()
+
+
+def _parse_iso(s: str) -> datetime.datetime:
+    dt = datetime.datetime.fromisoformat(s)
+    return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+
+
+def client_tz(client: dict) -> ZoneInfo:
+    try:
+        return ZoneInfo(client.get("timezone") or DEFAULT_TIMEZONE)
+    except Exception:  # noqa: BLE001 - bad timezone typed into admin
+        return ZoneInfo(DEFAULT_TIMEZONE)
+
+
+def _in_send_window(local: datetime.datetime) -> bool:
+    return SEND_WINDOW_START_HOUR <= local.hour < SEND_WINDOW_END_HOUR
+
+
+def _next_send_window(local: datetime.datetime) -> datetime.datetime:
+    if _in_send_window(local):
+        return local
+    start = local.replace(hour=SEND_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
+    return start if local.hour < SEND_WINDOW_START_HOUR else start + datetime.timedelta(days=1)
+
+
+def _fmt_when(local: datetime.datetime) -> str:
+    return local.strftime("%a, %b %-d at %-I:%M %p")
+
+
+def _same_phone(a: str, b: str) -> bool:
+    na, nb = _normalize_us_phone(a or ""), _normalize_us_phone(b or "")
+    return bool(na and nb and na == nb)
+
+
+def plan_has_growth(client: dict) -> bool:
+    # Clients added by hand before plans existed have no plan set: allow.
+    return (client.get("plan") or PLAN_GROWTH) in (PLAN_GROWTH, PLAN_FULL)
+
+
+def plan_from_tier(tier: str) -> str:
+    t = (tier or "").lower()
+    if "growth" in t:
+        return PLAN_GROWTH
+    if "full" in t:
+        return PLAN_FULL
+    return PLAN_STARTER
+
+
+def update_client_fields(twilio_number: str, **fields):
+    allowed = {k: v for k, v in fields.items() if k in ("plan", "timezone", "review_link", "place_id")}
+    if not allowed:
+        return
+    sets = ", ".join(f"{k} = ?" for k in allowed)
+    with closing(get_db()) as conn:
+        conn.execute(
+            f"UPDATE clients SET {sets}, updated_at = ? WHERE twilio_number = ?",
+            (*allowed.values(), datetime.datetime.utcnow().isoformat(), twilio_number),
+        )
+        conn.commit()
+
+
+def record_event(client_number: str, kind: str, contact: str = "", detail: str = ""):
+    if not client_number:
+        return
+    try:
+        with closing(get_db()) as conn:
+            conn.execute(
+                "INSERT INTO client_events (client_number, kind, contact, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+                (client_number, kind, contact or "", detail or "", _iso(_utcnow())),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:  # reporting must never break a call or text
+        log_event("record_event_failed", kind=kind, error=str(exc))
+
+
+def is_opted_out(phone: str) -> bool:
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT consented FROM sms_consent WHERE phone = ?", (phone,)).fetchone()
+        return bool(row) and not row["consented"]
+
+
+def schedule_message(client_number: str, to_phone: str, kind: str, body: str, send_at: datetime.datetime) -> int:
+    with closing(get_db()) as conn:
+        cur = conn.execute(
+            "INSERT INTO scheduled_messages (client_number, to_phone, kind, body, send_at, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            (client_number, to_phone, kind, body, _iso(send_at), _iso(_utcnow())),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def cancel_scheduled(client_number: str, to_phone: str, kind_prefix: str = "") -> int:
+    with closing(get_db()) as conn:
+        cur = conn.execute(
+            "UPDATE scheduled_messages SET status = 'canceled' WHERE client_number = ? AND to_phone = ? "
+            "AND status = 'pending' AND kind LIKE ?",
+            (client_number, to_phone, f"{kind_prefix}%"),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def pending_count(client_number: str, to_phone: str, kind_prefix: str) -> int:
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM scheduled_messages WHERE client_number = ? AND to_phone = ? "
+            "AND status = 'pending' AND kind LIKE ?",
+            (client_number, to_phone, f"{kind_prefix}%"),
+        ).fetchone()
+        return row["n"]
+
+
+def last_event(client_number: str, contact: str, kind: str) -> dict | None:
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM client_events WHERE client_number = ? AND contact = ? AND kind = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (client_number, contact, kind),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upcoming_appointment(client_number: str, contact: str) -> datetime.datetime | None:
+    evs = [e for e in (last_event(client_number, contact, "appt_scheduled"),
+                       last_event(client_number, contact, "appt_rescheduled")) if e]
+    ev = max(evs, key=lambda e: e["id"]) if evs else None
+    if not ev or not ev["detail"]:
+        return None
+    try:
+        when = _parse_iso(ev["detail"])
+    except ValueError:
+        return None
+    return when if when > _utcnow() - datetime.timedelta(hours=2) else None
+
+
+# ---------------------------------------------------------------- owner commands
+
+def owner_help_text(client: dict) -> str:
+    return (
+        f"ColdFront commands (text them to {_format_phone_for_display(client['twilio_number'])} from this phone):\n"
+        "done 4045551234 John - ask for a Google review\n"
+        "quote 4045551234 water heater $2,400 - follow up on a quote\n"
+        "appt 4045551234 tue 2pm John - confirm + remind them\n"
+        "omw 4045551234 20 - on our way (minutes optional)\n"
+        "stop 4045551234 - cancel their follow-ups/reminders\n"
+        "report - this month's numbers\n"
+        "reviewlink https://... - your Google review link"
+    )
+
+
+_PHONE_IN_TEXT = re.compile(r"(\+?1?[\s\-.(]*\d{3}[\s\-.)]*\d{3}[\s\-.]*\d{4})")
+
+
+def _split_command(body: str):
+    text = (body or "").strip()
+    cmd, _, rest = text.partition(" ")
+    cmd = cmd.lower().strip(":,.")
+    phone, m = None, _PHONE_IN_TEXT.search(rest)
+    if m:
+        phone = _normalize_us_phone(m.group(1))
+        if phone:
+            rest = (rest[: m.start()] + " " + rest[m.end():])
+    return cmd, phone, " ".join(rest.split())
+
+
+def handle_owner_command(client: dict, body: str) -> str:
+    cmd, phone, rest = _split_command(body)
+    number = client["twilio_number"]
+    biz = client["business_name"]
+    growth_cmds = {"done", "review", "quote", "appt", "appointment", "omw", "report"}
+
+    if cmd in growth_cmds and not plan_has_growth(client):
+        return (
+            "That's part of the Growth plan (review requests, quote follow-ups, reminders, monthly report). "
+            "Text Krish at ColdFront if you'd like to upgrade."
+        )
+
+    if cmd == "reviewlink":
+        link = rest.strip()
+        if not link.lower().startswith("http"):
+            return ("Send it like: reviewlink https://g.page/r/... (find it in your Google Business Profile "
+                    "under 'Ask for reviews').")
+        update_client_fields(number, review_link=link)
+        record_event(number, "review_link_set", "", link)
+        return "Saved. Review requests will use that link."
+
+    if cmd == "report":
+        return build_report(client, *month_bounds(client, _utcnow()), month_to_date=True)
+
+    if cmd in ("done", "review", "quote", "appt", "appointment", "omw", "stop") and not phone:
+        return f"I need the customer's number, e.g. '{cmd} 4045551234 ...'"
+
+    if phone and _same_phone(phone, number):
+        return "That's your ColdFront number. Use the customer's number."
+
+    if cmd in ("done", "review"):
+        return owner_review_request(client, phone, rest)
+    if cmd == "quote":
+        return owner_quote(client, phone, rest)
+    if cmd in ("appt", "appointment"):
+        return owner_appointment(client, phone, rest)
+    if cmd == "omw":
+        return owner_on_my_way(client, phone, rest)
+    if cmd == "stop":
+        n = cancel_scheduled(number, phone)
+        record_event(number, "followups_canceled", phone, str(n))
+        return (f"Canceled {n} scheduled text{'s' if n != 1 else ''} to {_format_phone_for_display(phone)}."
+                if n else f"Nothing scheduled for {_format_phone_for_display(phone)}.")
+    return owner_help_text(client)
+
+
+def _queue_or_send_note(local_send: datetime.datetime, now_local: datetime.datetime) -> str:
+    if local_send <= now_local + datetime.timedelta(minutes=1):
+        return "now"
+    return f"at {local_send.strftime('%-I:%M %p')} {'tomorrow' if local_send.date() > now_local.date() else 'today'} (quiet hours)"
+
+
+def owner_review_request(client: dict, phone: str, name: str) -> str:
+    number, display = client["twilio_number"], _format_phone_for_display(phone)
+    link = (client.get("review_link") or "").strip()
+    if not link:
+        return ("Set your Google review link first: text 'reviewlink https://g.page/r/...' "
+                "(Google Business Profile > Ask for reviews > copy link).")
+    if is_opted_out(phone):
+        return f"{display} opted out of texts, so I can't message them."
+    prev = last_event(number, phone, "review_request_sent")
+    if prev and _parse_iso(prev["created_at"]) > _utcnow() - datetime.timedelta(days=REVIEW_REQUEST_REPEAT_DAYS):
+        return f"Already asked {display} for a review on {_parse_iso(prev['created_at']).astimezone(client_tz(client)):%b %-d}, so I'll skip it."
+    if pending_count(number, phone, "review_request"):
+        return f"A review request to {display} is already queued."
+    first = name.split()[0].title() if name else ""
+    body = (
+        f"Hi{' ' + first if first else ''}, thanks for choosing {client['business_name']}! "
+        f"If you have a minute, a quick Google review would mean a lot to us: {link} "
+        "(Reply STOP to opt out)"
+    )
+    tz = client_tz(client)
+    now_local = _utcnow().astimezone(tz)
+    when = _next_send_window(now_local)
+    schedule_message(number, phone, "review_request", body, when)
+    record_event(number, "review_request_queued", phone, first)
+    return f"👍 Review request to {display} going out {_queue_or_send_note(when, now_local)}."
+
+
+def owner_quote(client: dict, phone: str, desc: str) -> str:
+    number, display = client["twilio_number"], _format_phone_for_display(phone)
+    if is_opted_out(phone):
+        return f"{display} opted out of texts, so I can't message them."
+    cancel_scheduled(number, phone, "quote_followup")
+    what = desc or "your project"
+    biz = client["business_name"]
+    bodies = [
+        f"Hi, it's {biz}. Just checking you got our quote for {what}. Any questions? Reply here anytime. (Reply STOP to opt out)",
+        f"Hi again from {biz}. Still happy to help with {what} whenever you're ready. Want us to get you on the schedule?",
+        f"Last check-in from {biz} about {what}. If now's not the time, no worries. Just reply here if you'd like to go ahead.",
+    ]
+    tz = client_tz(client)
+    today = _utcnow().astimezone(tz)
+    days = []
+    for d, body in zip(QUOTE_FOLLOWUP_DAYS, bodies):
+        local = (today + datetime.timedelta(days=d)).replace(hour=QUOTE_FOLLOWUP_HOUR, minute=0, second=0, microsecond=0)
+        schedule_message(number, phone, f"quote_followup_{d}", body, local)
+        days.append(local.strftime("%a %b %-d"))
+    record_event(number, "quote_started", phone, what)
+    return (f"👍 I'll follow up with {display} about {what} on {', '.join(days)} at "
+            f"{QUOTE_FOLLOWUP_HOUR}am, and stop as soon as they reply. Text 'stop {re.sub(r'[^0-9]', '', phone)[-10:]}' to cancel.")
+
+
+APPT_PARSE_PROMPT = """Now is {now} in the {tz} timezone. A business owner texted this about a customer appointment:
+"{text}"
+
+Extract the appointment's local date and time, and the customer's first name if one is given.
+Reply with ONLY JSON: {{"datetime": "YYYY-MM-DDTHH:MM" or null, "name": "First" or null}}
+Use the next upcoming occurrence for weekday names. If no clear time is given, use null for datetime."""
+
+
+def parse_appointment(text: str, tz: ZoneInfo) -> tuple[datetime.datetime | None, str]:
+    now_local = _utcnow().astimezone(tz)
+    m = re.search(r"(\d{4}-\d{2}-\d{2})[ T](\d{1,2}:\d{2})", text)
+    if m:
+        try:
+            dt = datetime.datetime.fromisoformat(f"{m.group(1)}T{m.group(2).zfill(5)}").replace(tzinfo=tz)
+            rest = (text[: m.start()] + text[m.end():]).strip()
+            return dt, (rest.split()[0].title() if rest else "")
+        except ValueError:
+            pass
+    if not ai_client:
+        return None, ""
+    try:
+        resp = ai_client.messages.create(
+            model=PARSE_MODEL,
+            max_tokens=80,
+            messages=[{"role": "user", "content": APPT_PARSE_PROMPT.format(
+                now=now_local.strftime("%A %Y-%m-%d %H:%M"), tz=str(tz), text=text[:300])}],
+        )
+        raw = "".join(b.text for b in resp.content if b.type == "text")
+        data = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
+    except (APIError, AttributeError, ValueError) as exc:
+        log_event("appt_parse_failed", error=str(exc))
+        return None, ""
+    name = (data.get("name") or "").strip().split(" ")[0].title() if data.get("name") else ""
+    if not data.get("datetime"):
+        return None, name
+    try:
+        return datetime.datetime.fromisoformat(data["datetime"]).replace(tzinfo=tz), name
+    except ValueError:
+        return None, name
+
+
+def owner_appointment(client: dict, phone: str, rest: str) -> str:
+    number, display = client["twilio_number"], _format_phone_for_display(phone)
+    if is_opted_out(phone):
+        return f"{display} opted out of texts, so I can't message them."
+    tz = client_tz(client)
+    when, name = parse_appointment(rest, tz)
+    now_local = _utcnow().astimezone(tz)
+    if not when:
+        return "I couldn't tell the time. Try: appt 4045551234 tue 2pm John (or 2026-10-28 14:00)."
+    if when <= now_local or when > now_local + datetime.timedelta(days=120):
+        return f"That reads as {_fmt_when(when)}, which isn't in the next 4 months. Double-check the date?"
+    biz = client["business_name"]
+    hi = f"Hi {name}" if name else "Hi"
+    replaced = cancel_scheduled(number, phone, "appt_") > 0 or upcoming_appointment(number, phone) is not None
+    confirm_at = _next_send_window(now_local)
+    if confirm_at < when:
+        schedule_message(number, phone, "appt_confirm",
+                         f"{hi}, you're booked with {biz} for {_fmt_when(when)}. Reply C to confirm, or reply "
+                         "here if you need to change it. (Reply STOP to opt out)", confirm_at)
+    sent = ["confirmation"]
+    day_before = when - datetime.timedelta(hours=24)
+    if day_before > now_local + datetime.timedelta(hours=1) and _in_send_window(day_before):
+        schedule_message(number, phone, "appt_reminder_24h",
+                         f"Reminder: {biz} is scheduled for tomorrow, {_fmt_when(when)}. Reply C to confirm or "
+                         "reply here to reschedule.", day_before)
+        sent.append("day-before reminder")
+    two_before = when - datetime.timedelta(hours=2)
+    if two_before > now_local + datetime.timedelta(minutes=30) and _in_send_window(two_before):
+        schedule_message(number, phone, "appt_reminder_2h",
+                         f"Reminder: {biz} will see you today at {when.strftime('%-I:%M %p')}. Reply here if "
+                         "anything changes.", two_before)
+        sent.append("2-hour reminder")
+    # A re-booking of the same customer isn't a new appointment for the report.
+    record_event(number, "appt_rescheduled" if replaced else "appt_scheduled", phone, _iso(when))
+    return f"👍 Booked {display} for {_fmt_when(when)}. They'll get: {', '.join(sent)}. Text 'stop {re.sub(r'[^0-9]', '', phone)[-10:]}' to cancel."
+
+
+def owner_on_my_way(client: dict, phone: str, rest: str) -> str:
+    number, display = client["twilio_number"], _format_phone_for_display(phone)
+    if is_opted_out(phone):
+        return f"{display} opted out of texts, so I can't message them."
+    m = re.search(r"\d{1,3}", rest or "")
+    eta = f" and should be there in about {int(m.group(0))} minutes" if m else ""
+    body = f"Hi, it's {client['business_name']}. We're on our way{eta}. See you soon!"
+    try:
+        send_sms(phone, body, number)
+        append_message(phone, "assistant", body)
+        record_event(number, "omw_sent", phone, m.group(0) if m else "")
+        return f"👍 Told {display} you're on the way."
+    except TwilioException as exc:
+        log_event("omw_send_failed", phone=phone, error=str(exc))
+        return f"That text to {display} didn't go through ({exc.__class__.__name__})."
+
+
+# ---------------------------------------------------------------- customer replies
+
+def handle_customer_reply(client: dict, caller: str, body: str, normalized: str) -> str | None:
+    """Returns a direct reply if this text was fully handled here (an
+    appointment confirmation); otherwise None and the AI replies as usual."""
+    number = client["twilio_number"]
+    record_event(number, "customer_text", caller)
+    appt = upcoming_appointment(number, caller)
+    if appt and normalized in CONFIRM_KEYWORDS:
+        record_event(number, "appt_confirmed", caller, _iso(appt))
+        _owner_ping(client, f"✅ {_format_phone_for_display(caller)} confirmed their appointment "
+                            f"({_fmt_when(appt.astimezone(client_tz(client)))}).")
+        reply = "Thanks, you're confirmed! See you then."
+        append_message(caller, "user", body)
+        append_message(caller, "assistant", reply)
+        return reply
+    if pending_count(number, caller, "quote_followup"):
+        cancel_scheduled(number, caller, "quote_followup")
+        record_event(number, "quote_replied", caller)
+        _owner_ping(client, f"💬 {_format_phone_for_display(caller)} replied to your quote follow-up: \"{body[:300]}\"")
+    elif appt:
+        _owner_ping(client, f"💬 {_format_phone_for_display(caller)} (appointment {_fmt_when(appt.astimezone(client_tz(client)))}) "
+                            f"texted: \"{body[:300]}\"")
+    return None
+
+
+def _owner_ping(client: dict, text: str):
+    if not client.get("forward_to"):
+        return
+    try:
+        send_sms(client["forward_to"], text, client["twilio_number"])
+    except TwilioException as exc:
+        log_event("owner_ping_failed", error=str(exc))
+
+
+# ---------------------------------------------------------------- monthly report
+
+def month_bounds(client: dict, when_utc: datetime.datetime, previous: bool = False):
+    local = when_utc.astimezone(client_tz(client))
+    start = local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if previous:
+        end = start
+        start = (start - datetime.timedelta(days=1)).replace(day=1)
+        return start, end
+    nxt = (start + datetime.timedelta(days=32)).replace(day=1)
+    return start, nxt
+
+
+def _count(conn, number, kind, start, end, distinct=False):
+    sel = "COUNT(DISTINCT contact)" if distinct else "COUNT(*)"
+    return conn.execute(
+        f"SELECT {sel} AS n FROM client_events WHERE client_number = ? AND kind = ? AND created_at >= ? AND created_at < ?",
+        (number, kind, _iso(start), _iso(end)),
+    ).fetchone()["n"]
+
+
+def build_report(client: dict, start: datetime.datetime, end: datetime.datetime, month_to_date: bool = False) -> str:
+    number = client["twilio_number"]
+    with closing(get_db()) as conn:
+        c = lambda kind, distinct=False: _count(conn, number, kind, start, end, distinct)  # noqa: E731
+        missed, texted = c("missed_call"), c("missed_call_texted")
+        convos, leads, vms = c("customer_text", True), c("lead_captured"), c("voicemail")
+        quotes, quote_replies = c("quote_started"), c("quote_replied")
+        appts, confirmed = c("appt_scheduled"), c("appt_confirmed")
+        reviews_asked = c("review_request_sent")
+        snaps = conn.execute(
+            "SELECT rating, review_count, checked_at FROM review_snapshots WHERE client_number = ? "
+            "AND checked_at >= ? AND checked_at < ? ORDER BY id",
+            (number, _iso(start), _iso(end)),
+        ).fetchall()
+    label = start.strftime("%B %Y") + (" so far" if month_to_date else "")
+    lines = [
+        f"📊 {client['business_name']}, {label}",
+        f"Missed calls caught: {missed} (texted back: {texted})",
+        f"Callers who texted back: {convos}",
+        f"Leads captured: {leads}",
+        f"Voicemails: {vms}",
+    ]
+    if plan_has_growth(client):
+        lines += [
+            f"Quotes followed up: {quotes} (replied: {quote_replies})",
+            f"Appointments booked: {appts} (confirmed: {confirmed})",
+            f"Review requests sent: {reviews_asked}",
+        ]
+    if snaps:
+        first, last = snaps[0], snaps[-1]
+        gained = (last["review_count"] or 0) - (first["review_count"] or 0)
+        lines.append(f"Google: {last['rating']} stars, {last['review_count']} reviews"
+                     + (f" (+{gained} this month)" if gained > 0 else ""))
+    return "\n".join(lines)
+
+
+def send_monthly_report(client: dict, now_utc: datetime.datetime):
+    start, end = month_bounds(client, now_utc, previous=True)
+    _owner_ping(client, build_report(client, start, end))
+    record_event(client["twilio_number"], "monthly_report_sent", "", start.strftime("%Y-%m"))
+
+
+# ---------------------------------------------------------------- review monitoring
+# Stopgap until Google approves Business Profile API access: the Places API
+# returns the overall rating/count plus up to 5 reviews Google picks as most
+# relevant (not necessarily the newest), so a new review can be missed.
+
+def fetch_place_reviews(place_id: str) -> dict:
+    req = urllib.request.Request(
+        f"https://places.googleapis.com/v1/places/{urllib.parse.quote(place_id)}",
+        headers={"X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                 "X-Goog-FieldMask": "rating,userRatingCount,reviews,googleMapsUri"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+
+def check_reviews(client: dict, fetch=None) -> int:
+    """Store a rating snapshot, alert the owner about new reviews of 3 stars
+    or less. The first check for a client seeds silently. Returns the
+    number of new reviews seen."""
+    number, place_id = client["twilio_number"], (client.get("place_id") or "").strip()
+    if not place_id:
+        return 0
+    try:
+        data = (fetch or fetch_place_reviews)(place_id)
+    except (urllib.error.URLError, ValueError, TimeoutError) as exc:
+        log_event("review_check_failed", client=number, error=str(exc))
+        return 0
+    now = _iso(_utcnow())
+    new = 0
+    with closing(get_db()) as conn:
+        first_run = conn.execute(
+            "SELECT COUNT(*) AS n FROM seen_reviews WHERE client_number = ?", (number,)
+        ).fetchone()["n"] == 0
+        conn.execute(
+            "INSERT INTO review_snapshots (client_number, rating, review_count, checked_at) VALUES (?, ?, ?, ?)",
+            (number, data.get("rating"), data.get("userRatingCount"), now),
+        )
+        alerts = []
+        for rv in data.get("reviews") or []:
+            key = rv.get("name") or f"{(rv.get('authorAttribution') or {}).get('displayName')}|{rv.get('publishTime')}"
+            text = ((rv.get("text") or rv.get("originalText") or {}).get("text") or "").strip()
+            author = (rv.get("authorAttribution") or {}).get("displayName") or "Someone"
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO seen_reviews (client_number, review_key, rating, author, text, published, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (number, key, rv.get("rating"), author, text[:1000], rv.get("publishTime", ""), now),
+            )
+            if cur.rowcount:
+                new += 1
+                if not first_run and (rv.get("rating") or 5) <= 3:
+                    alerts.append((rv.get("rating"), author, text))
+        conn.commit()
+    for rating, author, text in alerts:
+        _owner_ping(client, f"⚠️ New {rating}-star Google review for {client['business_name']} from {author}: "
+                            f"\"{text[:220]}\"\nReplying quickly and politely helps. "
+                            + (data.get("googleMapsUri") or ""))
+        record_event(number, "negative_review_alert", "", str(rating))
+    return new
+
+
+# ---------------------------------------------------------------- background sender
+
+def run_due_messages(now: datetime.datetime | None = None) -> int:
+    now = now or _utcnow()
+    with closing(get_db()) as conn:
+        due = [dict(r) for r in conn.execute(
+            "SELECT * FROM scheduled_messages WHERE status = 'pending' AND send_at <= ? ORDER BY send_at LIMIT 50",
+            (_iso(now),),
+        ).fetchall()]
+    sent = 0
+    for msg in due:
+        with closing(get_db()) as conn:
+            claimed = conn.execute(
+                "UPDATE scheduled_messages SET status = 'sending' WHERE id = ? AND status = 'pending'", (msg["id"],)
+            ).rowcount
+            conn.commit()
+        if not claimed:
+            continue
+        status, error = "sent", None
+        client = get_client_row(msg["client_number"])
+        if not client:
+            status = "canceled"
+        elif is_opted_out(msg["to_phone"]):
+            status = "skipped_opt_out"
+        else:
+            local = now.astimezone(client_tz(client))
+            if not _in_send_window(local):
+                if msg["kind"].startswith("appt_reminder"):
+                    status = "skipped_quiet_hours"  # late (e.g. after downtime); don't send a stale reminder at night
+                else:
+                    with closing(get_db()) as conn:
+                        conn.execute("UPDATE scheduled_messages SET status = 'pending', send_at = ? WHERE id = ?",
+                                     (_iso(_next_send_window(local)), msg["id"]))
+                        conn.commit()
+                    continue
+            else:
+                try:
+                    send_sms(msg["to_phone"], msg["body"], client["twilio_number"])
+                    append_message(msg["to_phone"], "assistant", msg["body"])
+                    kind = "review_request" if msg["kind"] == "review_request" else msg["kind"]
+                    record_event(client["twilio_number"], f"{kind}_sent", msg["to_phone"])
+                    sent += 1
+                except TwilioException as exc:
+                    status, error = "failed", str(exc)[:500]
+        with closing(get_db()) as conn:
+            conn.execute("UPDATE scheduled_messages SET status = ?, sent_at = ?, error = ? WHERE id = ?",
+                         (status, _iso(_utcnow()), error, msg["id"]))
+            conn.commit()
+    return sent
+
+
+def run_periodic_jobs(now: datetime.datetime | None = None):
+    now = now or _utcnow()
+    for client in list_clients():
+        # Every plan gets the monthly numbers (it's what keeps Starter
+        # clients seeing the value); review monitoring is Growth+.
+        local = now.astimezone(client_tz(client))
+        if local.day == 1 and local.hour >= 9:
+            prev = month_bounds(client, now, previous=True)[0].strftime("%Y-%m")
+            if claim_request_once(f"monthly_report:{client['twilio_number']}:{prev}"):
+                send_monthly_report(client, now)
+        if (plan_has_growth(client) and client.get("place_id") and GOOGLE_PLACES_API_KEY
+                and local.hour >= 10
+                and claim_request_once(f"review_check:{client['twilio_number']}:{local.date().isoformat()}")):
+            check_reviews(client)
+
+
+_scheduler_started = False
+_scheduler_lock = threading.Lock()
+
+
+def _scheduler_loop():
+    last_periodic = 0.0
+    while True:
+        try:
+            run_due_messages()
+        except Exception as exc:  # noqa: BLE001 - keep the loop alive no matter what
+            log_event("scheduler_send_error", error=str(exc))
+        if time.time() - last_periodic > 300:
+            last_periodic = time.time()
+            try:
+                run_periodic_jobs()
+            except Exception as exc:  # noqa: BLE001
+                log_event("scheduler_periodic_error", error=str(exc))
+        time.sleep(30)
+
+
+def start_scheduler():
+    global _scheduler_started
+    if os.environ.get("SCHEDULER_ENABLED", "1") != "1":
+        return
+    with _scheduler_lock:
+        if _scheduler_started:
+            return
+        _scheduler_started = True
+    threading.Thread(target=_scheduler_loop, name="coldfront-scheduler", daemon=True).start()
+    log_event("scheduler_started")
+
+
+start_scheduler()
+
+
+# ---------------------------------------------------------------- admin pages
+
+def _esc(s) -> str:
+    return (str(s if s is not None else "")
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+_ADMIN_CSS = """<style>
+body{font-family:-apple-system,sans-serif;max-width:980px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}
+table{width:100%;border-collapse:collapse;margin-bottom:2rem;font-size:.85rem}
+td,th{border:1px solid #ddd;padding:.45rem .6rem;text-align:left;vertical-align:top}
+th{background:#f5f5f5}nav a{font-size:.85rem;color:#555;margin-right:1rem}.muted{color:#777}
+button{padding:.35rem .8rem;cursor:pointer}
+</style>"""
+
+
+@app.route("/admin/pipeline", methods=["GET"])
+@require_admin_auth
+def admin_pipeline():
+    number = request.args.get("client", "")
+    client = get_client_row(number) if number else None
+    if not client:
+        links = "".join(
+            f"<li><a href='/admin/pipeline?client={urllib.parse.quote(c['twilio_number'])}'>{_esc(c['business_name'])}</a></li>"
+            for c in list_clients()
+        ) or "<li>No clients yet.</li>"
+        return f"<html><head><title>Pipeline</title>{_ADMIN_CSS}</head><body><nav><a href='/admin/clients'>&larr; Clients</a></nav><h1>Pipeline</h1><ul>{links}</ul></body></html>"
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT contact, kind, detail, created_at FROM client_events WHERE client_number = ? AND contact != '' "
+            "ORDER BY id", (number,),
+        ).fetchall()
+    tz = client_tz(client)
+    contacts: dict[str, dict] = {}
+    for r in rows:
+        c = contacts.setdefault(r["contact"], {"stage": None, "last": r["created_at"], "notes": []})
+        if r["kind"] in STAGE_RANK and (c["stage"] is None or STAGE_RANK[r["kind"]] >= STAGE_RANK[c["stage"]]):
+            c["stage"] = r["kind"]
+        c["last"] = r["created_at"]
+        if r["kind"] == "quote_started" and r["detail"]:
+            c["notes"].append(f"Quote: {r['detail']}")
+        if r["kind"] in ("appt_scheduled", "appt_rescheduled") and r["detail"]:
+            c["notes"].append("Appt " + _fmt_when(_parse_iso(r["detail"]).astimezone(tz)))
+    stage_names = dict(PIPELINE_STAGES)
+    ordered = sorted(contacts.items(), key=lambda kv: kv[1]["last"], reverse=True)
+    counts = {}
+    for _, c in ordered:
+        counts[c["stage"]] = counts.get(c["stage"], 0) + 1
+    summary = " · ".join(f"{stage_names[k]}: {counts[k]}" for k, _ in PIPELINE_STAGES if counts.get(k))
+    body = "".join(
+        f"<tr><td>{_esc(_format_phone_for_display(p))}</td><td>{_esc(stage_names.get(c['stage'], '—'))}</td>"
+        f"<td>{_esc(' · '.join(c['notes'][-2:]))}</td>"
+        f"<td class='muted'>{_parse_iso(c['last']).astimezone(tz):%b %-d, %-I:%M %p}</td></tr>"
+        for p, c in ordered
+    ) or "<tr><td colspan='4'>No activity yet.</td></tr>"
+    return f"""<html><head><title>Pipeline — {_esc(client['business_name'])}</title>{_ADMIN_CSS}</head><body>
+<nav><a href='/admin/clients'>&larr; Clients</a><a href='/admin/pipeline'>All pipelines</a></nav>
+<h1>{_esc(client['business_name'])} pipeline</h1><p class='muted'>{_esc(summary) or 'No activity yet.'}</p>
+<table><tr><th>Customer</th><th>Furthest stage</th><th>Notes</th><th>Last activity</th></tr>{body}</table>
+<h2>This month</h2><pre>{_esc(build_report(client, *month_bounds(client, _utcnow()), month_to_date=True))}</pre>
+</body></html>"""
+
+
+@app.route("/admin/reviews", methods=["GET", "POST"])
+@require_admin_auth
+def admin_reviews():
+    message = ""
+    if request.method == "POST":
+        client = get_client_row(request.form.get("client", ""))
+        if client and not GOOGLE_PLACES_API_KEY:
+            message = "Add GOOGLE_PLACES_API_KEY on Render first."
+        elif client:
+            n = check_reviews(client)
+            message = f"Checked {client['business_name']}: {n} review(s) not seen before."
+    sections = []
+    for client in list_clients():
+        if not client.get("place_id"):
+            continue
+        number = client["twilio_number"]
+        with closing(get_db()) as conn:
+            snap = conn.execute("SELECT * FROM review_snapshots WHERE client_number = ? ORDER BY id DESC LIMIT 1",
+                                (number,)).fetchone()
+            recent = conn.execute("SELECT * FROM seen_reviews WHERE client_number = ? ORDER BY published DESC LIMIT 5",
+                                  (number,)).fetchall()
+        head = (f"{snap['rating']} stars, {snap['review_count']} reviews · checked "
+                f"{_parse_iso(snap['checked_at']).astimezone(client_tz(client)):%b %-d %-I:%M %p}") if snap else "Not checked yet"
+        items = "".join(
+            f"<tr><td>{'★' * int(r['rating'] or 0)}</td><td>{_esc(r['author'])}</td><td>{_esc((r['text'] or '')[:300])}</td>"
+            f"<td class='muted'>{_esc((r['published'] or '')[:10])}</td></tr>" for r in recent
+        )
+        sections.append(
+            f"<h2>{_esc(client['business_name'])}</h2><p class='muted'>{_esc(head)}</p>"
+            f"<form method='POST'><input type='hidden' name='client' value='{_esc(number)}'><button>Check now</button></form>"
+            f"<table><tr><th>Rating</th><th>Author</th><th>Review</th><th>Date</th></tr>{items or '<tr><td colspan=4>None stored yet.</td></tr>'}</table>"
+        )
+    note = ("" if GOOGLE_PLACES_API_KEY else
+            "<p><b>GOOGLE_PLACES_API_KEY isn't set on Render, so automatic checks are off.</b></p>")
+    return f"""<html><head><title>Reviews</title>{_ADMIN_CSS}</head><body>
+<nav><a href='/admin/clients'>&larr; Clients</a></nav><h1>Google reviews</h1>{note}
+{'<p>' + _esc(message) + '</p>' if message else ''}
+<p class='muted'>Checked daily. Google only shares up to 5 reviews per business through this method, so this is a
+partial view until Business Profile API access is approved. Owners get a text for new reviews of 3 stars or less.</p>
+{''.join(sections) or '<p>No clients have a Google place ID set. Add one on the Clients page.</p>'}
+</body></html>"""
 
 
 if __name__ == "__main__":

@@ -1472,7 +1472,7 @@ def send_growth_howto(owner_phone: str, client_number: str):
         send_sms(
             owner_phone,
             owner_help_text(client) + "\nStart with your review link: Google Business Profile > Ask for reviews > copy, "
-            "then text 'reviewlink <link>'.",
+            f"then text 'reviewlink <link>'.\nYour dashboard (sign in with this phone): {PORTAL_URL}",
             TWILIO_NUMBER,
         )
     except TwilioException as exc:
@@ -3195,7 +3195,7 @@ def build_report(client: dict, start: datetime.datetime, end: datetime.datetime,
 
 def send_monthly_report(client: dict, now_utc: datetime.datetime):
     start, end = month_bounds(client, now_utc, previous=True)
-    _owner_ping(client, build_report(client, start, end))
+    _owner_ping(client, build_report(client, start, end) + f"\nDetails: {PORTAL_URL}")
     record_event(client["twilio_number"], "monthly_report_sent", "", start.strftime("%Y-%m"))
 
 
@@ -3377,17 +3377,10 @@ button{padding:.35rem .8rem;cursor:pointer}
 </style>"""
 
 
-@app.route("/admin/pipeline", methods=["GET"])
-@require_admin_auth
-def admin_pipeline():
-    number = request.args.get("client", "")
-    client = get_client_row(number) if number else None
-    if not client:
-        links = "".join(
-            f"<li><a href='/admin/pipeline?client={urllib.parse.quote(c['twilio_number'])}'>{_esc(c['business_name'])}</a></li>"
-            for c in list_clients()
-        ) or "<li>No clients yet.</li>"
-        return f"<html><head><title>Pipeline</title>{_ADMIN_CSS}</head><body><nav><a href='/admin/clients'>&larr; Clients</a></nav><h1>Pipeline</h1><ul>{links}</ul></body></html>"
+def pipeline_table_html(client: dict, limit: int = 200) -> tuple[str, str]:
+    """Each customer's furthest stage, newest activity first. Returns
+    (table html, one-line summary)."""
+    number = client["twilio_number"]
     with closing(get_db()) as conn:
         rows = conn.execute(
             "SELECT contact, kind, detail, created_at FROM client_events WHERE client_number = ? AND contact != '' "
@@ -3406,20 +3399,54 @@ def admin_pipeline():
             c["notes"].append("Appt " + _fmt_when(_parse_iso(r["detail"]).astimezone(tz)))
     stage_names = dict(PIPELINE_STAGES)
     ordered = sorted(contacts.items(), key=lambda kv: kv[1]["last"], reverse=True)
-    counts = {}
+    counts: dict = {}
     for _, c in ordered:
-        counts[c["stage"]] = counts.get(c["stage"], 0) + 1
-    summary = " · ".join(f"{stage_names[k]}: {counts[k]}" for k, _ in PIPELINE_STAGES if counts.get(k))
+        counts[stage_names.get(c["stage"], "Other")] = counts.get(stage_names.get(c["stage"], "Other"), 0) + 1
+    summary = " · ".join(f"{k}: {v}" for k, v in counts.items())
     body = "".join(
         f"<tr><td>{_esc(_format_phone_for_display(p))}</td><td>{_esc(stage_names.get(c['stage'], '—'))}</td>"
         f"<td>{_esc(' · '.join(c['notes'][-2:]))}</td>"
         f"<td class='muted'>{_parse_iso(c['last']).astimezone(tz):%b %-d, %-I:%M %p}</td></tr>"
-        for p, c in ordered
+        for p, c in ordered[:limit]
     ) or "<tr><td colspan='4'>No activity yet.</td></tr>"
+    table = ("<table><tr><th>Customer</th><th>Furthest stage</th><th>Notes</th><th>Last activity</th></tr>"
+             f"{body}</table>")
+    return table, summary
+
+
+def reviews_html(client: dict) -> str:
+    number = client["twilio_number"]
+    with closing(get_db()) as conn:
+        snap = conn.execute("SELECT * FROM review_snapshots WHERE client_number = ? ORDER BY id DESC LIMIT 1",
+                            (number,)).fetchone()
+        recent = conn.execute("SELECT * FROM seen_reviews WHERE client_number = ? ORDER BY published DESC LIMIT 5",
+                              (number,)).fetchall()
+    head = (f"{snap['rating']} stars, {snap['review_count']} reviews · checked "
+            f"{_parse_iso(snap['checked_at']).astimezone(client_tz(client)):%b %-d %-I:%M %p}") if snap else "Not checked yet"
+    items = "".join(
+        f"<tr><td>{'★' * int(r['rating'] or 0)}</td><td>{_esc(r['author'])}</td><td>{_esc((r['text'] or '')[:300])}</td>"
+        f"<td class='muted'>{_esc((r['published'] or '')[:10])}</td></tr>" for r in recent
+    )
+    return (f"<p class='muted'>{_esc(head)}</p><table><tr><th>Rating</th><th>Author</th><th>Review</th><th>Date</th></tr>"
+            f"{items or '<tr><td colspan=4>None stored yet.</td></tr>'}</table>")
+
+
+@app.route("/admin/pipeline", methods=["GET"])
+@require_admin_auth
+def admin_pipeline():
+    number = request.args.get("client", "")
+    client = get_client_row(number) if number else None
+    if not client:
+        links = "".join(
+            f"<li><a href='/admin/pipeline?client={urllib.parse.quote(c['twilio_number'])}'>{_esc(c['business_name'])}</a></li>"
+            for c in list_clients()
+        ) or "<li>No clients yet.</li>"
+        return f"<html><head><title>Pipeline</title>{_ADMIN_CSS}</head><body><nav><a href='/admin/clients'>&larr; Clients</a></nav><h1>Pipeline</h1><ul>{links}</ul></body></html>"
+    table, summary = pipeline_table_html(client)
     return f"""<html><head><title>Pipeline — {_esc(client['business_name'])}</title>{_ADMIN_CSS}</head><body>
 <nav><a href='/admin/clients'>&larr; Clients</a><a href='/admin/pipeline'>All pipelines</a></nav>
 <h1>{_esc(client['business_name'])} pipeline</h1><p class='muted'>{_esc(summary) or 'No activity yet.'}</p>
-<table><tr><th>Customer</th><th>Furthest stage</th><th>Notes</th><th>Last activity</th></tr>{body}</table>
+{table}
 <h2>This month</h2><pre>{_esc(build_report(client, *month_bounds(client, _utcnow()), month_to_date=True))}</pre>
 </body></html>"""
 
@@ -3440,21 +3467,10 @@ def admin_reviews():
         if not client.get("place_id"):
             continue
         number = client["twilio_number"]
-        with closing(get_db()) as conn:
-            snap = conn.execute("SELECT * FROM review_snapshots WHERE client_number = ? ORDER BY id DESC LIMIT 1",
-                                (number,)).fetchone()
-            recent = conn.execute("SELECT * FROM seen_reviews WHERE client_number = ? ORDER BY published DESC LIMIT 5",
-                                  (number,)).fetchall()
-        head = (f"{snap['rating']} stars, {snap['review_count']} reviews · checked "
-                f"{_parse_iso(snap['checked_at']).astimezone(client_tz(client)):%b %-d %-I:%M %p}") if snap else "Not checked yet"
-        items = "".join(
-            f"<tr><td>{'★' * int(r['rating'] or 0)}</td><td>{_esc(r['author'])}</td><td>{_esc((r['text'] or '')[:300])}</td>"
-            f"<td class='muted'>{_esc((r['published'] or '')[:10])}</td></tr>" for r in recent
-        )
         sections.append(
-            f"<h2>{_esc(client['business_name'])}</h2><p class='muted'>{_esc(head)}</p>"
+            f"<h2>{_esc(client['business_name'])}</h2>"
             f"<form method='POST'><input type='hidden' name='client' value='{_esc(number)}'><button>Check now</button></form>"
-            f"<table><tr><th>Rating</th><th>Author</th><th>Review</th><th>Date</th></tr>{items or '<tr><td colspan=4>None stored yet.</td></tr>'}</table>"
+            + reviews_html(client)
         )
     note = ("" if GOOGLE_PLACES_API_KEY else
             "<p><b>GOOGLE_PLACES_API_KEY isn't set on Render, so automatic checks are off.</b></p>")
@@ -3465,6 +3481,192 @@ def admin_reviews():
 partial view until Business Profile API access is approved. Owners get a text for new reviews of 3 stars or less.</p>
 {''.join(sections) or '<p>No clients have a Google place ID set. Add one on the Clients page.</p>'}
 </body></html>"""
+
+
+# =====================================================================
+# OWNER PORTAL — a business owner signs in with a code texted to the
+# cell phone on file for them (their forward_to), no password, and sees
+# their own pipeline, Google reviews, this month's numbers and commands.
+# =====================================================================
+import hmac
+import secrets
+from itsdangerous import BadSignature, URLSafeTimedSerializer
+
+PORTAL_COOKIE = "cf_portal"
+PORTAL_SESSION_DAYS = 30
+PORTAL_CODE_MINUTES = 10
+PORTAL_CODE_MAX_ATTEMPTS = 5
+
+
+def _portal_secret() -> str:
+    """Signing key for portal cookies, generated once and kept on the
+    persistent disk so sign-ins survive redeploys. No env var to manage."""
+    with closing(get_db()) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        row = conn.execute("SELECT value FROM app_settings WHERE key = 'portal_secret'").fetchone()
+        if row:
+            return row["value"]
+        value = secrets.token_hex(32)
+        conn.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('portal_secret', ?)", (value,))
+        conn.commit()
+        return conn.execute("SELECT value FROM app_settings WHERE key = 'portal_secret'").fetchone()["value"]
+
+
+def init_portal_db():
+    with closing(get_db()) as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS portal_codes (
+                phone TEXT PRIMARY KEY,
+                code_hash TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        conn.commit()
+
+
+init_portal_db()
+_portal_signer = URLSafeTimedSerializer(_portal_secret(), salt="coldfront-owner-portal")
+
+
+def clients_for_owner(phone: str) -> list[dict]:
+    return [c for c in list_clients() if _same_phone(c.get("forward_to", ""), phone)]
+
+
+def _hash_code(phone: str, code: str) -> str:
+    return hmac.new(_portal_secret().encode(), f"{phone}:{code}".encode(), "sha256").hexdigest()
+
+
+def portal_owner_phone() -> str | None:
+    token = request.cookies.get(PORTAL_COOKIE, "")
+    if not token:
+        return None
+    try:
+        phone = _portal_signer.loads(token, max_age=PORTAL_SESSION_DAYS * 86400)
+    except BadSignature:
+        return None
+    return phone if clients_for_owner(phone) else None
+
+
+_PORTAL_CSS = """<style>
+:root{color-scheme:light}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:860px;margin:0 auto;padding:1.25rem 1rem 3rem;color:#16161d;background:#fafafa}
+h1{font-size:1.4rem;margin:.2rem 0 1rem}h2{font-size:1.1rem;margin:2rem 0 .6rem}
+.card{background:#fff;border:1px solid #e6e6ea;border-radius:10px;padding:1rem 1.1rem;margin-bottom:1rem}
+table{width:100%;border-collapse:collapse;font-size:.85rem}td,th{border-bottom:1px solid #eee;padding:.5rem .4rem;text-align:left;vertical-align:top}
+th{color:#666;font-weight:600}.muted{color:#777;font-size:.85rem}pre{white-space:pre-wrap;font:inherit;margin:0}
+input{font-size:1rem;padding:.65rem;border:1px solid #ccc;border-radius:8px;width:100%;box-sizing:border-box;margin:.4rem 0 .8rem}
+button{font-size:1rem;padding:.65rem 1.2rem;border:0;border-radius:8px;background:#2f4cff;color:#fff;cursor:pointer}
+.top{display:flex;justify-content:space-between;align-items:center}.top a{color:#555;font-size:.9rem}
+.wrap{overflow-x:auto}code{background:#f1f1f4;padding:.1rem .3rem;border-radius:4px}
+</style>"""
+
+
+def _portal_page(title: str, inner: str) -> Response:
+    html = (f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{_esc(title)} · ColdFront</title>{_PORTAL_CSS}</head><body>{inner}</body></html>")
+    resp = Response(html, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Frame-Options"] = "DENY"
+    return resp
+
+
+def _portal_login_form(message: str = "", phone: str = "", code_step: bool = False) -> Response:
+    if code_step:
+        form = (f"<form method='POST' action='/portal/verify'><input type='hidden' name='phone' value='{_esc(phone)}'>"
+                "<label>6-digit code</label><input name='code' inputmode='numeric' autocomplete='one-time-code' maxlength='6' autofocus>"
+                "<button>Sign in</button></form>")
+    else:
+        form = ("<form method='POST' action='/portal/login'><label>Your cell number (the one ColdFront texts your leads to)</label>"
+                "<input name='phone' type='tel' autocomplete='tel' autofocus><button>Text me a code</button></form>")
+    return _portal_page("Sign in", f"<h1>ColdFront: sign in</h1><div class='card'>"
+                        f"{'<p>' + _esc(message) + '</p>' if message else ''}{form}</div>")
+
+
+@app.route("/portal", methods=["GET"])
+def portal_home():
+    phone = portal_owner_phone()
+    if not phone:
+        return _portal_login_form()
+    sections = []
+    for client in clients_for_owner(phone):
+        table, summary = pipeline_table_html(client, limit=100)
+        report = build_report(client, *month_bounds(client, _utcnow()), month_to_date=True)
+        review_block = (f"<h2>Google reviews</h2><div class='card wrap'>{reviews_html(client)}"
+                        "<p class='muted'>You'll get a text for any new review of 3 stars or less.</p></div>"
+                        if client.get("place_id") else "")
+        commands = (f"<h2>Text commands</h2><div class='card'><pre>{_esc(owner_help_text(client))}</pre></div>"
+                    if plan_has_growth(client) else "")
+        sections.append(
+            f"<h1>{_esc(client['business_name'])}</h1>"
+            f"<div class='card'><pre>{_esc(report)}</pre></div>"
+            f"<h2>Your customers</h2><p class='muted'>{_esc(summary) or 'No activity yet.'}</p>"
+            f"<div class='card wrap'>{table}</div>{review_block}{commands}"
+        )
+    top = "<div class='top'><span class='muted'>ColdFront</span><a href='/portal/logout'>Sign out</a></div>"
+    return _portal_page("Your dashboard", top + "".join(sections))
+
+
+@app.route("/portal/login", methods=["POST"])
+def portal_login():
+    phone = _normalize_us_phone(request.form.get("phone", "")) or ""
+    generic = "If that number is on file, we just texted it a 6-digit code."
+    if not phone:
+        return _portal_login_form("Enter a 10-digit US cell number.")
+    if _rate_limited(f"portal-login-ip:{request.remote_addr}") or _rate_limited(f"portal-login-phone:{phone}"):
+        return _portal_login_form("Too many tries. Wait 10 minutes and try again.")
+    if clients_for_owner(phone):
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        expires = _iso(_utcnow() + datetime.timedelta(minutes=PORTAL_CODE_MINUTES))
+        with closing(get_db()) as conn:
+            conn.execute(
+                "INSERT INTO portal_codes (phone, code_hash, expires_at, attempts) VALUES (?, ?, ?, 0) "
+                "ON CONFLICT(phone) DO UPDATE SET code_hash=excluded.code_hash, expires_at=excluded.expires_at, attempts=0",
+                (phone, _hash_code(phone, code), expires),
+            )
+            conn.commit()
+        try:
+            send_sms(phone, f"Your ColdFront sign-in code is {code}. It expires in {PORTAL_CODE_MINUTES} minutes.", TWILIO_NUMBER)
+            log_event("portal_code_sent", phone=phone)
+        except TwilioException as exc:
+            log_event("portal_code_send_failed", phone=phone, error=str(exc))
+    else:
+        log_event("portal_login_unknown_phone")
+    return _portal_login_form(generic, phone, code_step=True)
+
+
+@app.route("/portal/verify", methods=["POST"])
+def portal_verify():
+    phone = _normalize_us_phone(request.form.get("phone", "")) or ""
+    code = re.sub(r"\D", "", request.form.get("code", ""))
+    bad = _portal_login_form("That code didn't work. Check it, or go back and request a new one.", phone, code_step=True)
+    if not phone or len(code) != 6:
+        return bad
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT * FROM portal_codes WHERE phone = ?", (phone,)).fetchone()
+        if not row or row["attempts"] >= PORTAL_CODE_MAX_ATTEMPTS or _parse_iso(row["expires_at"]) < _utcnow():
+            return bad
+        conn.execute("UPDATE portal_codes SET attempts = attempts + 1 WHERE phone = ?", (phone,))
+        conn.commit()
+        if not hmac.compare_digest(row["code_hash"], _hash_code(phone, code)):
+            return bad
+        conn.execute("DELETE FROM portal_codes WHERE phone = ?", (phone,))
+        conn.commit()
+    resp = Response("", status=303, headers={"Location": "/portal"})
+    resp.set_cookie(PORTAL_COOKIE, _portal_signer.dumps(phone), max_age=PORTAL_SESSION_DAYS * 86400,
+                    httponly=True, secure=PUBLIC_BASE_URL.startswith("https"), samesite="Lax")
+    log_event("portal_login", phone=phone)
+    return resp
+
+
+@app.route("/portal/logout", methods=["GET"])
+def portal_logout():
+    resp = Response("", status=303, headers={"Location": "/portal"})
+    resp.delete_cookie(PORTAL_COOKIE)
+    return resp
+
+
+PORTAL_URL = f"{PUBLIC_BASE_URL.rstrip('/')}/portal"
 
 
 if __name__ == "__main__":

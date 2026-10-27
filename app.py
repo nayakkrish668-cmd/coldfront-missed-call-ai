@@ -834,7 +834,7 @@ def notify_owner_of_lead(caller: str, lead: dict, client: dict):
     mark_owner_notified(caller)
 
 
-def ai_reply(caller: str, incoming_text: str, client: dict) -> str:
+def ai_reply(caller: str, incoming_text: str, client: dict, state: dict | None = None) -> str:
     append_message(caller, "user", incoming_text)
     history = get_history(caller)
 
@@ -853,6 +853,8 @@ def ai_reply(caller: str, incoming_text: str, client: dict) -> str:
                     reply_text += block.text
                 elif block.type == "tool_use" and block.name == "capture_lead":
                     notify_owner_of_lead(caller, block.input, client)
+                    if state is not None:
+                        state["captured"] = True
             reply_text = reply_text.strip() or (
                 "Thanks — I've got what I need and I'm passing it to the team now!"
             )
@@ -943,15 +945,92 @@ FLAG_FOR_FOLLOWUP_TOOL = {
 }
 
 
+# ---------------------------------------------------------------------
+# Demo line -> sale. The demo text conversation is pure role-play (the AI
+# plays the prospect's own receptionist), so on its own it never pitches
+# anything. Once a prospect has seen enough of it, add ONE short note
+# saying "that was the demo, reply SETUP to get it on your line". A SETUP
+# reply hands them to the sales assistant above, which can text the real
+# checkout link.
+# ---------------------------------------------------------------------
+DEMO_LINE_SOURCE = "demo-line"
+DEMO_WRAPUP_AFTER_USER_TURNS = 3
+DEMO_SETUP_KEYWORDS = {"SETUP", "SET UP", "SET IT UP", "SIGN UP", "SIGNUP", "SIGN ME UP"}
+
+
+def _request_key_seen(request_key: str) -> bool:
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM processed_webhooks WHERE request_key = ?", (request_key,)
+        ).fetchone()
+        return row is not None
+
+
+def demo_wrapup_text(caller: str) -> str:
+    override = get_demo_override(caller)
+    whose = f"{override['business']}'s customers" if override else "your customers"
+    return (
+        f"(That was the demo: it's exactly what {whose} would get when you miss a call. "
+        "Want it running on your real line? Reply SETUP and I'll send the details. "
+        "- ColdFront Studio)"
+    )
+
+
+def maybe_demo_wrapup(caller: str, captured: bool) -> str | None:
+    """The wrap-up text to add after this demo reply, or None. Sent once per
+    caller, after the AI captured a lead or a few back-and-forths in."""
+    user_turns = sum(1 for m in get_history(caller) if m["role"] == "user")
+    if not captured and user_turns < DEMO_WRAPUP_AFTER_USER_TURNS:
+        return None
+    if not claim_request_once(f"demo_wrapup:{caller}"):
+        return None
+    text = demo_wrapup_text(caller)
+    append_message(caller, "assistant", text)
+    log_event("demo_wrapup_sent", caller=caller, captured=captured)
+    return text
+
+
+def start_sales_from_demo(caller: str) -> str:
+    override = get_demo_override(caller) or {}
+    business, trade = override.get("business", ""), override.get("trade", "")
+    mark_sales_thread(caller, business, trade, "", DEMO_LINE_SOURCE)
+    thread = get_sales_thread(caller) or {"business": business, "trade": trade, "page": DEMO_LINE_SOURCE}
+    try:
+        send_sms(
+            FORWARD_TO,
+            f"🔥 {business or 'A demo caller'} ({_format_phone_for_display(caller)}) tried the demo line "
+            "and replied SETUP. The AI is texting them the details now.",
+            TWILIO_NUMBER,
+        )
+    except TwilioException as exc:
+        log_event("demo_setup_owner_notify_failed", caller=caller, error=str(exc))
+    log_event("demo_setup_requested", caller=caller, business=business)
+    note = (
+        "[SYSTEM: The lead just replied SETUP after the demo — they want this on their real line. "
+        "Thank them, give the plan that fits in a sentence, and help them start the trial.]"
+    )
+    return ai_sales_reply(caller, note, thread)
+
+
 def build_sales_system_prompt(thread: dict) -> str:
     business = thread.get("business") or "their business"
     trade = thread.get("trade") or "a home-service"
     preferred_design = thread.get("preferred_design") or "one of the designs"
-    return f"""You are the AI sales assistant for ColdFront Studio, texting a lead who just \
+    if thread.get("page") == DEMO_LINE_SOURCE:
+        intro = f"""You are the AI sales assistant for ColdFront Studio, texting a lead who runs \
+{business}, a {trade} business. They got a cold email from ColdFront, called the live demo line, and \
+just went through the demo text conversation (the earlier messages in this thread were the demo: the AI \
+was playing THEIR receptionist and they were playing a customer). After the demo they replied SETUP, \
+meaning they want it on their real line. They have NOT necessarily seen the pricing page, so briefly \
+give the price that fits when it's relevant, then help them start the trial — don't re-explain how the \
+text-back works, they just experienced it."""
+    else:
+        intro = f"""You are the AI sales assistant for ColdFront Studio, texting a lead who just \
 submitted the "get a free mockup" request form on ColdFront's own marketing site. This lead runs \
 {business}, a {trade} business, and had already scrolled through the full pitch (including the \
 personalized demo and pricing) before requesting this, so they are warm — your job is to close them \
-over text, not to re-explain the whole pitch.
+over text, not to re-explain the whole pitch."""
+    return intro + f"""
 
 CRITICAL — this business runs entirely over TEXT, never a phone call:
 - Never offer, suggest, or agree to a phone call, with you or with Krish. If a lead asks to "hop on a \
@@ -1815,10 +1894,22 @@ def sms():
         )
         return Response(str(resp), mimetype="text/xml")
 
-    reply_text = ai_reply(caller, body, client)
+    is_demo_line = not (to_number and get_client_row(to_number))
+
+    if is_demo_line and normalized in DEMO_SETUP_KEYWORDS and _request_key_seen(f"demo_wrapup:{caller}"):
+        reply_text = start_sales_from_demo(caller)
+        resp.message(reply_text)
+        return Response(str(resp), mimetype="text/xml")
+
+    state: dict = {}
+    reply_text = ai_reply(caller, body, client, state)
     log_event("ai_reply_sent", caller=caller, reply=reply_text)
 
     resp.message(reply_text)
+    if is_demo_line:
+        wrapup = maybe_demo_wrapup(caller, state.get("captured", False))
+        if wrapup:
+            resp.message(wrapup)
     return Response(str(resp), mimetype="text/xml")
 
 

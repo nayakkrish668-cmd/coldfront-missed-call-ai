@@ -1821,6 +1821,19 @@ def voice_opt_in():
     log_event("sms_opt_in", caller=caller, consented=consented, digits_received=digits)
 
     vr = VoiceResponse()
+    if not (to_number and get_client_row(to_number)) and get_demo_override(caller):
+        # A preloaded/registered prospect trying the demo line. Ringing
+        # Krish's cell first just makes them wait (and if he picks up by
+        # habit, the demo never happens), so text right away.
+        call_sid = request.values.get("CallSid", "")
+        if consented and (not call_sid or claim_request_once(f"voice_status:{call_sid}")):
+            send_missed_call_text(caller, client)
+            vr.say("Thanks. Check your phone, we just texted you. Reply to see how it works.")
+        else:
+            vr.say("No problem. To try the demo, call back and press 1 when asked.")
+        vr.hangup()
+        return Response(str(vr), mimetype="text/xml")
+
     if client.get("routing_mode") == ROUTING_CARRIER_FORWARD:
         # The business's own line already rang out before the carrier sent
         # this call here, so don't ring anyone again — text now (if they
@@ -2474,6 +2487,43 @@ def admin_bulk_demo_overrides():
     return {"loaded": len(rows), "skipped": skipped}
 
 
+@app.route("/email-unsubscribe", methods=["POST", "OPTIONS"])
+def email_unsubscribe():
+    """The coldfront.studio/unsubscribe page posts here, so opt-outs land in
+    a list the email scripts pull automatically (suppress.py sync) instead
+    of depending on someone reading an inbox."""
+    if request.method == "OPTIONS":
+        resp = Response("", status=204)
+    elif _rate_limited(f"email-unsub:{request.remote_addr}"):
+        resp = Response("", status=429)
+    else:
+        email = _clean_text(request.form.get("email", ""), 200).lower()
+        if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            with closing(get_db()) as conn:
+                conn.execute("CREATE TABLE IF NOT EXISTS email_unsubscribes (email TEXT PRIMARY KEY, created_at TEXT NOT NULL)")
+                conn.execute("INSERT OR IGNORE INTO email_unsubscribes (email, created_at) VALUES (?, ?)",
+                             (email, datetime.datetime.utcnow().isoformat()))
+                conn.commit()
+            log_event("email_unsubscribed")
+            resp = Response("", status=204)
+        else:
+            resp = Response("", status=400)
+    resp.headers["Access-Control-Allow-Origin"] = ALLOWED_SITE_ORIGIN
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+
+@app.route("/admin/email-unsubscribes.csv", methods=["GET"])
+@require_admin_auth
+def admin_email_unsubscribes():
+    with closing(get_db()) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS email_unsubscribes (email TEXT PRIMARY KEY, created_at TEXT NOT NULL)")
+        rows = conn.execute("SELECT email, created_at FROM email_unsubscribes ORDER BY created_at").fetchall()
+    body = "email,date\n" + "".join(f"{r['email']},{r['created_at'][:10]}\n" for r in rows)
+    return Response(body, mimetype="text/csv")
+
+
 # Real Payment Link IDs (Starter / Growth) — used to tag which tier someone
 # just bought. Full-Service has no self-serve link (it's a "talk to us"
 # mailto), so it never reaches this webhook.
@@ -2955,9 +3005,39 @@ def _queue_or_send_note(local_send: datetime.datetime, now_local: datetime.datet
     return f"at {local_send.strftime('%-I:%M %p')} {'tomorrow' if local_send.date() > now_local.date() else 'today'} (quiet hours)"
 
 
+def review_link_from_place(place_id: str | None) -> str:
+    place_id = (place_id or "").strip()
+    return f"https://search.google.com/local/writereview?placeid={urllib.parse.quote(place_id)}" if place_id else ""
+
+
+def find_place_id(client: dict) -> str | None:
+    """Look the business up on Google by name and match on a phone number we
+    have for it. Only accepts an exact phone match, so it never guesses."""
+    if not GOOGLE_PLACES_API_KEY:
+        return None
+    phones = {p for p in (_normalize_us_phone(client.get(k) or "") for k in ("emergency_phone", "twilio_number", "forward_to")) if p}
+    body = json.dumps({"textQuery": client["business_name"], "maxResultCount": 10}).encode()
+    req = urllib.request.Request(
+        "https://places.googleapis.com/v1/places:searchText", data=body, method="POST",
+        headers={"Content-Type": "application/json", "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                 "X-Goog-FieldMask": "places.id,places.nationalPhoneNumber,places.internationalPhoneNumber"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            places = json.loads(r.read().decode()).get("places") or []
+    except (urllib.error.URLError, ValueError, TimeoutError) as exc:
+        log_event("place_lookup_failed", client=client["twilio_number"], error=str(exc))
+        return None
+    for pl in places:
+        for key in ("nationalPhoneNumber", "internationalPhoneNumber"):
+            if _normalize_us_phone(pl.get(key) or "") in phones:
+                return pl.get("id")
+    return None
+
+
 def owner_review_request(client: dict, phone: str, name: str) -> str:
     number, display = client["twilio_number"], _format_phone_for_display(phone)
-    link = (client.get("review_link") or "").strip()
+    link = (client.get("review_link") or "").strip() or review_link_from_place(client.get("place_id"))
     if not link:
         return ("Set your Google review link first: text 'reviewlink https://g.page/r/...' "
                 "(Google Business Profile > Ask for reviews > copy link).")
@@ -3324,6 +3404,13 @@ def run_periodic_jobs(now: datetime.datetime | None = None):
             prev = month_bounds(client, now, previous=True)[0].strftime("%Y-%m")
             if claim_request_once(f"monthly_report:{client['twilio_number']}:{prev}"):
                 send_monthly_report(client, now)
+        if (GOOGLE_PLACES_API_KEY and not client.get("place_id")
+                and claim_request_once(f"place_lookup:{client['twilio_number']}:{local.date().isoformat()}")):
+            found = find_place_id(client)
+            if found:
+                update_client_fields(client["twilio_number"], place_id=found)
+                client = get_client_row(client["twilio_number"])
+                log_event("place_id_found", client=client["twilio_number"])
         if (plan_has_growth(client) and client.get("place_id") and GOOGLE_PLACES_API_KEY
                 and local.hour >= 10
                 and claim_request_once(f"review_check:{client['twilio_number']}:{local.date().isoformat()}")):

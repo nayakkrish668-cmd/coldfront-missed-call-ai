@@ -1881,7 +1881,7 @@ def voice_opt_in():
 def send_missed_call_text(caller: str, client: dict):
     body = (
         f"Hey! Sorry we missed your call at {client['business_name']}. "
-        f"What can we help with? (Reply here and we'll get right back to you.)"
+        f"What can we help with? (Reply here and we'll get right back to you. Reply STOP to opt out.)"
     )
     try:
         send_sms(caller, body, client["twilio_number"])
@@ -3170,7 +3170,7 @@ def owner_on_my_way(client: dict, phone: str, rest: str) -> str:
         return f"{display} opted out of texts, so I can't message them."
     m = re.search(r"\d{1,3}", rest or "")
     eta = f" and should be there in about {int(m.group(0))} minutes" if m else ""
-    body = f"Hi, it's {client['business_name']}. We're on our way{eta}. See you soon!"
+    body = f"Hi, it's {client['business_name']}. We're on our way{eta}. See you soon! (Reply STOP to opt out)"
     try:
         send_sms(phone, body, number)
         append_message(phone, "assistant", body)

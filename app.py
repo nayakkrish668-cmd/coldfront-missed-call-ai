@@ -1418,6 +1418,20 @@ def provision_client_number(
                     twilio_number=bought.phone_number,
                     error=str(exc),
                 )
+                # This is the exact failure a sole-proprietor registration causes
+                # (it allows one number). Tell Krish right away: the client's
+                # texts will be blocked until this number is registered.
+                try:
+                    send_sms(
+                        FORWARD_TO,
+                        f"⚠️ {business or 'A new client'}'s number {bought.phone_number} could NOT be "
+                        "attached to the approved texting registration, so its texts will be blocked "
+                        "by carriers. Don't tell them it's live. Fix the registration first "
+                        f"(Twilio error: {str(exc)[:120]}).",
+                        TWILIO_NUMBER,
+                    )
+                except Exception:
+                    pass
         upsert_client(
             bought.phone_number, business or "New Client", trade or "home services", forward_to,
             emergency_phone=emergency_phone,

@@ -228,6 +228,10 @@ def init_db():
             conn.execute("ALTER TABLE onboarding_threads ADD COLUMN subscription_id TEXT")
         except sqlite3.OperationalError:
             pass  # already has the column
+        try:
+            conn.execute("ALTER TABLE onboarding_threads ADD COLUMN completed_at TEXT")
+        except sqlite3.OperationalError:
+            pass  # already has the column
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS demo_overrides (
@@ -481,9 +485,27 @@ def mark_onboarding_thread(
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(phone) DO UPDATE SET email=excluded.email, customer_name=excluded.customer_name, "
             "business=excluded.business, tier=excluded.tier, checkout_session_id=excluded.checkout_session_id, "
-            "subscription_id=excluded.subscription_id",
+            "subscription_id=excluded.subscription_id, completed_at=NULL",
             (phone, email, customer_name, business, tier, checkout_session_id, subscription_id, datetime.datetime.utcnow().isoformat()),
         )
+        conn.commit()
+
+
+def claim_onboarding_completion(phone: str) -> bool:
+    """Atomically marks setup as done. True only for the FIRST caller, so a customer's later
+    texts can never buy a second Twilio number or send the setup texts twice."""
+    with closing(get_db()) as conn:
+        cur = conn.execute(
+            "UPDATE onboarding_threads SET completed_at = ? WHERE phone = ? AND completed_at IS NULL",
+            (datetime.datetime.utcnow().isoformat(), phone),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def release_onboarding_claim(phone: str):
+    with closing(get_db()) as conn:
+        conn.execute("UPDATE onboarding_threads SET completed_at = NULL WHERE phone = ?", (phone,))
         conn.commit()
 
 
@@ -1240,7 +1262,15 @@ def build_onboarding_system_prompt(thread: dict) -> str:
     business = thread.get("business") or "their business"
     customer_name = thread.get("customer_name") or "there"
     tier = thread.get("tier") or "their plan"
-    return f"""You are ColdFront Studio's AI assistant, texting {customer_name}, who JUST PAID for the \
+    done_note = ""
+    if thread.get("completed_at"):
+        done_note = (
+            "\n\nSETUP IS ALREADY DONE: their number was provisioned and they were sent the next steps. "
+            "Do NOT say you are setting anything up or kicking anything off. Answer their question in 1-2 "
+            "sentences: the one remaining step is forwarding unanswered calls on their business line to their "
+            "new ColdFront number (shown in the earlier texts), and Krish will text exact carrier steps.\n\n"
+        )
+    return done_note + f"""You are ColdFront Studio's AI assistant, texting {customer_name}, who JUST PAID for the \
 {tier} plan for their business, {business}. They're already a customer now, not a lead — this \
 conversation is onboarding, not selling.
 
@@ -1547,9 +1577,13 @@ def complete_onboarding(phone: str, thread: dict, info: dict):
 
 def _defer_complete_onboarding(phone: str, thread: dict, info: dict, delay: float = 6.0):
     def _run():
+        if not claim_onboarding_completion(phone):
+            log_event("complete_onboarding_skipped_already_done", phone=phone)
+            return
         try:
             complete_onboarding(phone, thread, info)
         except Exception as exc:  # never lose a paid customer's setup silently
+            release_onboarding_claim(phone)
             log_event("complete_onboarding_failed", phone=phone, error=str(exc))
             try:
                 alert_owner_of_system_failure("onboarding_setup_failed", f"Setup failed for {phone}: {exc}")
@@ -1575,7 +1609,7 @@ def ai_onboarding_reply(phone: str, incoming_text: str, thread: dict) -> str:
                 model="claude-sonnet-5",
                 max_tokens=300,
                 system=build_onboarding_system_prompt(thread),
-                tools=[ONBOARDING_CAPTURE_TOOL],
+                **({} if thread.get("completed_at") else {"tools": [ONBOARDING_CAPTURE_TOOL]}),
                 messages=history,
             )
             reply_text = ""

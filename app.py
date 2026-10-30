@@ -1545,6 +1545,21 @@ def complete_onboarding(phone: str, thread: dict, info: dict):
         send_intake_form_link(phone)
 
 
+def _defer_complete_onboarding(phone: str, thread: dict, info: dict, delay: float = 6.0):
+    def _run():
+        try:
+            complete_onboarding(phone, thread, info)
+        except Exception as exc:  # never lose a paid customer's setup silently
+            log_event("complete_onboarding_failed", phone=phone, error=str(exc))
+            try:
+                alert_owner_of_system_failure("onboarding_setup_failed", f"Setup failed for {phone}: {exc}")
+            except Exception:
+                pass
+    t = threading.Timer(delay, _run)
+    t.daemon = True
+    t.start()
+
+
 def ai_onboarding_reply(phone: str, incoming_text: str, thread: dict) -> str:
     append_message(phone, "user", incoming_text)
     history = get_history(phone)
@@ -1563,7 +1578,9 @@ def ai_onboarding_reply(phone: str, incoming_text: str, thread: dict) -> str:
                 if block.type == "text":
                     reply_text += block.text
                 elif block.type == "tool_use" and block.name == "capture_onboarding_info":
-                    complete_onboarding(phone, thread, block.input)
+                    # Run setup a few seconds AFTER this reply is delivered, so the customer reads
+                    # "next text will have your last step" before the setup texts arrive, not after.
+                    _defer_complete_onboarding(phone, thread, dict(block.input))
             reply_text = reply_text.strip() or "Got it, thanks!"
         except APIError as exc:
             log_event("onboarding_ai_reply_failed", phone=phone, error=str(exc))

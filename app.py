@@ -1563,6 +1563,11 @@ def _defer_complete_onboarding(phone: str, thread: dict, info: dict, delay: floa
 def ai_onboarding_reply(phone: str, incoming_text: str, thread: dict) -> str:
     append_message(phone, "user", incoming_text)
     history = get_history(phone)
+    while history and history[0]["role"] != "user":
+        history.pop(0)  # the API needs the first turn to be the user's
+    history = history[-30:]
+    while history and history[0]["role"] != "user":
+        history.pop(0)
 
     if ai_client:
         try:
@@ -2034,7 +2039,11 @@ def sms():
             log_event("onboarding_sms_opt_in_via_text", caller=caller)
             resp.message("You're resubscribed to ColdFront Studio texts. Reply STOP at any time to opt out.")
             return Response(str(resp), mimetype="text/xml")
-        reply_text = ai_onboarding_reply(caller, body, onboarding_thread)
+        try:
+            reply_text = ai_onboarding_reply(caller, body, onboarding_thread)
+        except Exception as exc:  # noqa: BLE001 - a paying customer must always get an answer
+            log_event("onboarding_reply_crashed", caller=caller, error=f"{exc.__class__.__name__}: {exc}")
+            reply_text = "Thanks! Got your message. Krish will text you back shortly."
         log_event("onboarding_ai_reply_sent", caller=caller, reply=reply_text)
         resp.message(reply_text)
         return Response(str(resp), mimetype="text/xml")
@@ -2171,7 +2180,12 @@ def admin_clients():
         action = request.form.get("action", "save")
         twilio_number = request.form.get("twilio_number", "").strip()
 
-        if action == "delete":
+        if action == "release":
+            if twilio_number:
+                row = get_client_row(twilio_number)
+                release_client_number(twilio_number, (row or {}).get("business_name", ""))
+                message = f"Removed {twilio_number} and released it back to Twilio (stops its monthly charge)."
+        elif action == "delete":
             if twilio_number:
                 delete_client(twilio_number)
                 message = f"Removed {twilio_number}."
@@ -2217,7 +2231,11 @@ def admin_clients():
                 <td><form method="POST" style="display:inline" onsubmit="return confirm('Remove {c['business_name']}?')">
                     <input type="hidden" name="action" value="delete">
                     <input type="hidden" name="twilio_number" value="{c['twilio_number']}">
-                    <button type="submit">Remove</button></form></td>
+                    <button type="submit">Remove</button></form>
+                    <form method="POST" style="display:inline" onsubmit="return confirm('Remove {c['business_name']} AND release {c['twilio_number']} back to Twilio? This cannot be undone.')">
+                    <input type="hidden" name="action" value="release">
+                    <input type="hidden" name="twilio_number" value="{c['twilio_number']}">
+                    <button type="submit">Remove + release number</button></form></td>
             </tr>"""
             for c in clients
         )
@@ -3440,6 +3458,7 @@ _scheduler_lock = threading.Lock()
 
 def _scheduler_loop():
     last_periodic = 0.0
+    time.sleep(20)  # let the rest of the module finish loading before the first run
     while True:
         try:
             run_due_messages()
